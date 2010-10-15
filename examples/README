@@ -1,10 +1,21 @@
-The Hello World and Voter examples included here are intended to be used with example projects shipped with the main distribution. You will need to have a server running with the appropriate catalog for these examples to work.
+The Hello World and Voter examples included here are intended to
+be used with example projects shipped with the main distribution.
+You will need to have a server running with the appropriate catalog
+for these examples to work.
 
-You will need to copy voltdbclient.py to the examples directory for the examples to run.
+You will need to copy voltdbclient.py to the examples directory for
+the examples to run.
 
 Hello World requires no arguments and connects to localhost.
 
-Voter has seven arguments: 
-[number of contestants] [votes per phone number] [transactions per second] [client feedback interval (seconds)] [test duration (seconds)] [lag record delay (seconds)] [server list (comma separated)]
+Voter has seven arguments:
+    [number of contestants]
+    [votes per phone number]
+    [transactions per second]
+    [client feedback interval (seconds)]
+    [test duration (seconds)]
+    [lag record delay (seconds)]
+    [server list (comma separated)]
+
 A reasonable default invocation that connects to localhost is:
 ./voter.py 6 2 100000 5 120 3 localhost
