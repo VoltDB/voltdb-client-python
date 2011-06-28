@@ -77,6 +77,7 @@ class FastSerializer:
     VOLTTYPE_DECIMAL_STRING = 23  # 9 byte long
     VOLTTYPE_MONEY = 20     # 8 byte long
     VOLTTYPE_VOLTTABLE = 21
+    VOLTTYPE_VARBINARY = 25
 
     # SQL NULL indicator for object type serializations (string, decimal)
     NULL_STRING_INDICATOR = -1
@@ -128,6 +129,7 @@ class FastSerializer:
                        self.VOLTTYPE_BIGINT: self.readInt64,
                        self.VOLTTYPE_FLOAT: self.readFloat64,
                        self.VOLTTYPE_STRING: self.readString,
+                       self.VOLTTYPE_VARBINARY: self.readVarbinary,
                        self.VOLTTYPE_TIMESTAMP: self.readDate,
                        self.VOLTTYPE_DECIMAL: self.readDecimal,
                        self.VOLTTYPE_DECIMAL_STRING: self.readDecimalString}
@@ -138,6 +140,7 @@ class FastSerializer:
                        self.VOLTTYPE_BIGINT: self.writeInt64,
                        self.VOLTTYPE_FLOAT: self.writeFloat64,
                        self.VOLTTYPE_STRING: self.writeString,
+                       self.VOLTTYPE_VARBINARY: self.writeVarbinary,
                        self.VOLTTYPE_TIMESTAMP: self.writeDate,
                        self.VOLTTYPE_DECIMAL: self.writeDecimal,
                        self.VOLTTYPE_DECIMAL_STRING: self.writeDecimalString}
@@ -149,8 +152,7 @@ class FastSerializer:
                              self.VOLTTYPE_STRING: self.readStringArray,
                              self.VOLTTYPE_TIMESTAMP: self.readDateArray,
                              self.VOLTTYPE_DECIMAL: self.readDecimalArray,
-                             self.VOLTTYPE_DECIMAL_STRING:
-                                 self.readDecimalStringArray}
+                             self.VOLTTYPE_DECIMAL_STRING: self.readDecimalStringArray}
 
         self.__compileStructs()
 
@@ -183,12 +185,16 @@ class FastSerializer:
                               lambda x:
                               if_else(x == self.__class__.NULL_STRING_INDICATOR,
                                       None, x),
+                          self.VOLTTYPE_VARBINARY:
+                              lambda x:
+                              if_else(x == self.__class__.NULL_STRING_INDICATOR,
+                                      None, x),
                           self.VOLTTYPE_DECIMAL:
                               lambda x:
                               if_else(x == self.NULL_DECIMAL_INDICATOR,
                                       None, x)}
 
-        if username != None and password != None:
+        if username != None and password != None and host != None:
             self.authenticate(username, password)
 
     def __compileStructs(self):
@@ -201,6 +207,7 @@ class FastSerializer:
         self.uint64Type = lambda length : '%c%dQ' % (self.inputBOM, length)
         self.float64Type = lambda length : '%c%dd' % (self.inputBOM, length)
         self.stringType = lambda length : '%c%ds' % (self.inputBOM, length)
+        self.varbinaryType = lambda length : '%c%ds' % (self.inputBOM, length)
 
     def close(self):
         if self.dump_file != None:
@@ -359,17 +366,22 @@ class FastSerializer:
         if (not array) or (len(array) == 0) or (not type):
             return
 
-        if type not in self.WRITER:
+        if type not in self.ARRAY_READER:
             print "ERROR: Unsupported date type (", type, ")."
             exit(-2)
 
-        self.writeInt16(len(array))
+        # serialize arrays of bytes as larger values to support
+        # strings and varbinary input
+        if type != FastSerializer.VOLTTYPE_TINYINT:
+            self.writeInt16(len(array))
+        else:
+            self.writeInt32(len(array))
 
         for i in array:
             self.WRITER[type](i)
 
     def writeWireTypeArray(self, type, array):
-        if type not in self.WRITER:
+        if type not in self.ARRAY_READER:
             print "ERROR: can't write wire type(", type, ") yet."
             exit(-2)
 
@@ -384,7 +396,7 @@ class FastSerializer:
         return val
 
     def readByteArray(self):
-        length = self.readInt16()
+        length = self.readInt32()
         val = self.readByteArrayContent(length)
         val = map(self.NullCheck[self.VOLTTYPE_TINYINT], val)
         return val
@@ -534,6 +546,32 @@ class FastSerializer:
         encoded_value = value.encode("utf-8")
         self.writeInt32(len(encoded_value))
         self.wbuf.extend(encoded_value)
+
+    # varbinary
+    def readVarbinaryContent(self, cnt):
+        if cnt == 0:
+            return array.array('c', [])
+
+        offset = cnt * struct.calcsize('c')
+        val = struct.unpack(self.varbinaryType(cnt), self.rbuf[:offset])
+        self.rbuf = self.rbuf[offset:]
+
+        return array.array('c', val[0])
+
+    def readVarbinary(self):
+        # length preceeded (4 byte value) string
+        length = self.readInt32()
+        if self.NullCheck[self.VOLTTYPE_VARBINARY](length) == None:
+            return None
+        return self.readVarbinaryContent(length)
+
+    def writeVarbinary(self, value):
+        if value is None:
+            self.writeInt32(self.NULL_STRING_INDICATOR)
+            return
+
+        self.writeInt32(len(value))
+        self.wbuf.extend(value)
 
     # date
     # The timestamp we receive from the server is a 64-bit integer representing
@@ -817,6 +855,7 @@ class VoltException:
 
     def __init__(self, fser):
         self.type = self.VOLTEXCEPTION_NONE
+        self.typestr = "None"
         self.message = ""
 
         if fser != None:
@@ -839,13 +878,11 @@ class VoltException:
         self.message = ''.join(self.message)
 
         if self.type == self.VOLTEXCEPTION_GENERIC:
-            print "Python client got a generic serializable exception:", \
-                self.message
+            self.typestr = "Generic"
         elif self.type == self.VOLTEXCEPTION_EEEXCEPTION:
+            self.typestr = "EE Exception"
             # serialized size from EEException.java is 4 bytes
             self.error_code = fser.readInt32()
-            print "Exception was a Volt EE Exception, error code: %d" % \
-                (self.error_code)
         elif self.type == self.VOLTEXCEPTION_SQLEXCEPTION or \
                 self.type == self.VOLTEXCEPTION_CONSTRAINTFAILURE:
             self.sql_state_bytes = []
@@ -854,21 +891,31 @@ class VoltException:
             self.sql_state_bytes = ''.join(self.sql_state_bytes)
 
             if self.type == self.VOLTEXCEPTION_SQLEXCEPTION:
-                print "Exception was a Volt SQL Exception ", self.sql_state_bytes
+                self.typestr = "SQL Exception"
             else:
+                self.typestr = "Constraint Failure"
                 self.constraint_type = fser.readInt32()
                 self.table_name = fser.readString()
                 self.buffer_size = fser.readInt32()
                 self.buffer = []
                 for i in xrange(0, self.buffer_size):
                     self.buffer.append(fser.readByte())
-                print "Exception was a Volt Constraint Failure Exception" \
-                    " of type %d on table ID %s" % (self.constraint_type,
-                                                    self.table_name)
         else:
             for i in xrange(0, self.length - 3 - 2 - self.message_len):
                 fser.readByte()
             print "Python client deserialized unknown VoltException."
+
+    def __str__(self):
+        msgstr = "VoltException: type: %s\n" % self.typestr
+        if self.type == self.VOLTEXCEPTION_EEEXCEPTION:
+            msgstr += "  Error code: %d\n" % self.error_code
+        elif self.type == self.VOLTEXCEPTION_SQLEXCEPTION:
+            msgstr += "  SQL code: "
+            msgstr += self.sql_state_bytes
+        elif self.type == self.VOLTEXCEPTION_SQLEXCEPTION:
+            msgstr += "  Constraint violation type: %d\n" + self.constraint_type
+            msgstr += "  on table: %s\n" + self.table_name
+        return msgstr
 
 class VoltResponse:
     "VoltDB called procedure response (ClientResponse.java)"
@@ -919,9 +966,16 @@ class VoltResponse:
 
     def __str__(self):
         tablestr = "\n\n".join([str(i) for i in self.tables])
-        return "Status: %d\nInformation: %s\n%s" % (self.status,
-                                                    self.statusString,
-                                                    tablestr)
+        if self.exception is None:
+            return "Status: %d\nInformation: %s\n%s" % (self.status,
+                                                        self.statusString,
+                                                        tablestr)
+        else:
+            msgstr = "Status: %d\nInformation: %s\n%s\n" % (self.status,
+                                                            self.statusString,
+                                                            tablestr)
+            msgstr += "Exception: %s" % (self.exception)
+            return msgstr
 
 class VoltProcedure:
     "VoltDB called procedure interface"
