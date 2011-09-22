@@ -25,13 +25,14 @@
 import array
 import socket
 import struct
-import datetime
+import datetime as _datetime
 import time
 import decimal
 try:
     from hashlib import sha1 as sha
 except ImportError:
     from sha import sha
+from cStringIO import StringIO
 
 decimal.getcontext().prec = 38
 
@@ -100,10 +101,11 @@ class FastSerializer:
     # that host order is little endian. See isNaN().
 
     def __init__(self, host = None, port = 21212, username = "",
-                 password = "", dump_file = None):
+                 password = "", dump_file = 'dump'):
         # connect a socket to host, port and get a file object
-        self.wbuf = array.array('c')
+        self.wbuf = StringIO()
         self.rbuf = ""
+        self.offset = 0
         self.host = host
         self.port = port
         self.dump_file = None
@@ -114,7 +116,7 @@ class FastSerializer:
         if self.host != None and self.port != None:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setblocking(1)
-            self.socket.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.socket.connect((self.host, self.port))
 
         # input can be big or little endian
@@ -155,6 +157,7 @@ class FastSerializer:
                              self.VOLTTYPE_DECIMAL_STRING: self.readDecimalStringArray}
 
         self.__compileStructs()
+        self.offset = 0
 
         # Check if the value of a given type is NULL
         self.NULL_DECIMAL_INDICATOR = \
@@ -235,9 +238,8 @@ class FastSerializer:
         m = sha()
         m.update(password)
         pwHash = m.digest()
-        self.wbuf.extend(pwHash)
+        self.wbuf.write(pwHash)
 
-        self.prependLength()
         self.flush()
 
         # A length, version number, and status code is returned
@@ -265,30 +267,32 @@ class FastSerializer:
         # recompile the structs
         self.__compileStructs()
 
-    def prependLength(self):
+    def getLength(self):
         # write 32 bit array length at offset 0, NOT including the
         # size of this length preceding value. This value is written
         # in the network order.
-        ttllen = self.wbuf.buffer_info()[1] * self.wbuf.itemsize
+        ttllen = self.wbuf.tell()
         lenBytes = struct.pack(self.inputBOM + 'i', ttllen)
-        map(lambda x: self.wbuf.insert(0, x), lenBytes[::-1])
+        return lenBytes
 
     def size(self):
         """Returns the size of the write buffer.
         """
 
-        return (self.wbuf.buffer_info()[1] * self.wbuf.itemsize)
+        return (self.wbuf.tell())
 
     def flush(self):
         if self.socket == None:
             print "ERROR: not connected to server."
             exit(-1)
 
-        if self.dump_file != None:
-            self.dump_file.write(self.wbuf)
+        if self.dump_file != None and False:
+            self.dump_file.write(self.wbuf.getvalue())
             self.dump_file.write("\n")
-        self.socket.sendall(self.wbuf.tostring())
-        self.wbuf = array.array('c')
+        self.socket.sendall(self.getLength())
+        self.socket.sendall(self.wbuf.getvalue())
+        self.wbuf = StringIO()
+        return None
 
     def bufferForRead(self):
         if self.socket == None:
@@ -305,11 +309,15 @@ class FastSerializer:
         if self.dump_file != None:
             self.dump_file.write(responseprefix)
         responseLength = struct.unpack(self.int32Type(1), responseprefix)[0]
-        while (len(self.rbuf) < responseLength):
-            self.rbuf += self.socket.recv(responseLength - len(self.rbuf))
+        r = StringIO()
+        while (r.tell() < responseLength):
+            r.write(self.socket.recv(responseLength - r.tell()))
+        self.rbuf = r.getvalue()
+        self.offset = 0
         if self.dump_file != None:
             self.dump_file.write(self.rbuf)
             self.dump_file.write("\n")
+        return None
 
     def read(self, type):
         if type not in self.READER:
@@ -344,7 +352,7 @@ class FastSerializer:
         """Appends the given raw bytes to the end of the write buffer.
         """
 
-        self.wbuf.extend(value)
+        return self.wbuf.write(value)
 
     def __str__(self):
         return repr(self.wbuf)
@@ -386,13 +394,13 @@ class FastSerializer:
             exit(-2)
 
         self.writeByte(type)
-        self.writeArray(type, array)
+        return self.writeArray(type, array)
 
     # byte
     def readByteArrayContent(self, cnt):
-        offset = cnt * struct.calcsize('b')
-        val = struct.unpack(self.byteType(cnt), self.rbuf[:offset])
-        self.rbuf = self.rbuf[offset:]
+        offset = self.offset + cnt
+        val = struct.unpack(self.byteType(cnt), self.rbuf[self.offset:offset])
+        self.offset = offset
         return val
 
     def readByteArray(self):
@@ -410,13 +418,13 @@ class FastSerializer:
             val = self.__class__.NULL_TINYINT_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.byteType(1), val))
+        return self.wbuf.write(struct.pack(self.byteType(1), val))
 
     # int16
     def readInt16ArrayContent(self, cnt):
-        offset = cnt * struct.calcsize('h')
-        val = struct.unpack(self.int16Type(cnt), self.rbuf[:offset])
-        self.rbuf = self.rbuf[offset:]
+        offset = self.offset + cnt * 2
+        val = struct.unpack(self.int16Type(cnt), self.rbuf[self.offset:offset])
+        self.offset = offset
         return val
 
     def readInt16Array(self):
@@ -434,13 +442,13 @@ class FastSerializer:
             val = self.__class__.NULL_SMALLINT_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.int16Type(1), val))
+        return self.wbuf.write(struct.pack(self.int16Type(1), val))
 
     # int32
     def readInt32ArrayContent(self, cnt):
-        offset = cnt * struct.calcsize('i')
-        val = struct.unpack(self.int32Type(cnt), self.rbuf[:offset])
-        self.rbuf = self.rbuf[offset:]
+        offset = self.offset + cnt * 4
+        val = struct.unpack(self.int32Type(cnt), self.rbuf[self.offset:offset])
+        self.offset = offset
         return val
 
     def readInt32Array(self):
@@ -458,13 +466,13 @@ class FastSerializer:
             val = self.__class__.NULL_INTEGER_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.int32Type(1), val))
+        return self.wbuf.write(struct.pack(self.int32Type(1), val))
 
     # int64
     def readInt64ArrayContent(self, cnt):
-        offset = cnt * struct.calcsize('q')
-        val = struct.unpack(self.int64Type(cnt), self.rbuf[:offset])
-        self.rbuf = self.rbuf[offset:]
+        offset = self.offset + cnt * 8
+        val = struct.unpack(self.int64Type(cnt), self.rbuf[self.offset:offset])
+        self.offset = offset
         return val
 
     def readInt64Array(self):
@@ -482,13 +490,13 @@ class FastSerializer:
             val = self.__class__.NULL_BIGINT_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.int64Type(1), val))
+        return self.wbuf.write(struct.pack(self.int64Type(1), val))
 
     # float64
     def readFloat64ArrayContent(self, cnt):
-        offset = cnt * struct.calcsize('d')
-        val = struct.unpack(self.float64Type(cnt), self.rbuf[:offset])
-        self.rbuf = self.rbuf[offset:]
+        offset = self.offset + cnt * 8
+        val = struct.unpack(self.float64Type(cnt), self.rbuf[self.offset:offset])
+        self.offset = offset
         return val
 
     def readFloat64Array(self):
@@ -510,16 +518,16 @@ class FastSerializer:
         tmp = array.array("d", [val])
         if self.inputBOM != self.localBOM:
             tmp.byteswap()
-        self.wbuf.extend(tmp.tostring())
+        return self.wbuf.write(tmp.tostring())
 
     # string
     def readStringContent(self, cnt):
         if cnt == 0:
             return ""
 
-        offset = cnt * struct.calcsize('c')
-        val = struct.unpack(self.stringType(cnt), self.rbuf[:offset])
-        self.rbuf = self.rbuf[offset:]
+        offset = self.offset + cnt
+        val = struct.unpack(self.stringType(cnt), self.rbuf[self.offset:offset])
+        self.offset = offset
         return val[0].decode("utf-8")
 
     def readString(self):
@@ -545,17 +553,16 @@ class FastSerializer:
 
         encoded_value = value.encode("utf-8")
         self.writeInt32(len(encoded_value))
-        self.wbuf.extend(encoded_value)
+        return self.wbuf.write(encoded_value)
 
     # varbinary
     def readVarbinaryContent(self, cnt):
         if cnt == 0:
             return array.array('c', [])
 
-        offset = cnt * struct.calcsize('c')
-        val = struct.unpack(self.varbinaryType(cnt), self.rbuf[:offset])
-        self.rbuf = self.rbuf[offset:]
-
+        offset = self.offset + cnt
+        val = struct.unpack(self.varbinaryType(cnt), self.rbuf[self.offset:offset])
+        self.offset = offset
         return array.array('c', val[0])
 
     def readVarbinary(self):
@@ -571,7 +578,7 @@ class FastSerializer:
             return
 
         self.writeInt32(len(value))
-        self.wbuf.extend(value)
+        return self.wbuf.write(value)
 
     # date
     # The timestamp we receive from the server is a 64-bit integer representing
@@ -582,7 +589,7 @@ class FastSerializer:
         if raw == None:
             return None
         # microseconds before or after Jan 1, 1970 UTC
-        return datetime.datetime.fromtimestamp(raw/1000000.0)
+        return _datetime.datetime.fromtimestamp(raw/1000000.0)
 
     def readDateArray(self):
         retval = []
@@ -591,7 +598,7 @@ class FastSerializer:
         for i in raw:
             val = None
             if i != None:
-                val = datetime.datetime.fromtimestamp(i/1000000.0)
+                val = _datetime.datetime.fromtimestamp(i/1000000.0)
             retval.append(val)
 
         return tuple(retval)
@@ -602,15 +609,15 @@ class FastSerializer:
         else:
             seconds = int(value.strftime("%s"))
             val = seconds * 1000000 + value.microsecond
-        self.wbuf.extend(struct.pack(self.int64Type(1), val))
+        return self.wbuf.write(struct.pack(self.int64Type(1), val))
 
     def readDecimal(self):
-        offset = 16 * struct.calcsize('b')
-        if self.NullCheck[self.VOLTTYPE_DECIMAL](self.rbuf[:offset]) == None:
-            self.rbuf = self.rbuf[offset:]
+        offset = self.offset + 16
+        if self.NullCheck[self.VOLTTYPE_DECIMAL](self.rbuf[self.offset:offset]) == None:
+            self.offset = offset
             return None
-        val = list(struct.unpack(self.ubyteType(16), self.rbuf[:offset]))
-        self.rbuf = self.rbuf[offset:]
+        val = list(struct.unpack(self.ubyteType(16), self.rbuf[self.offset:offset]))
+        self.offset = offset
         mostSignificantBit = 1 << 7
         isNegative = (val[0] & mostSignificantBit) != 0
         unscaledValue = -(val[0] & mostSignificantBit) << 120
@@ -681,7 +688,7 @@ class FastSerializer:
 
     def writeDecimal(self, num):
         if num is None:
-            self.wbuf.extend(self.NULL_DECIMAL_INDICATOR)
+            self.wbuf.write(self.NULL_DECIMAL_INDICATOR)
             return
         if not isinstance(num, decimal.Decimal):
             raise TypeError("num must be of the type decimal.Decimal")
@@ -698,7 +705,7 @@ class FastSerializer:
         scale_factor = self.__class__.DEFAULT_DECIMAL_SCALE - scale
         unscaled_int = int(decimal.Decimal((0, digits, scale_factor)))
         data = self.__intToBytes(unscaled_int, sign)
-        self.wbuf.extend(data)
+        return self.wbuf.write(data)
 
     def writeDecimalString(self, num):
         if num is None:
@@ -706,7 +713,7 @@ class FastSerializer:
             return
         if not isinstance(num, decimal.Decimal):
             raise TypeError("num must be of type decimal.Decimal")
-        self.writeString(num.to_eng_string())
+        return self.writeString(num.to_eng_string())
 
     # cash!
     def readMoney(self):
@@ -841,7 +848,6 @@ class VoltTable:
             table_fser.writeInt32(row_fser.size())
             table_fser.writeRawBytes(row_fser.getRawBytes())
 
-        table_fser.prependLength()
         self.fser.writeRawBytes(table_fser.getRawBytes())
 
 
@@ -931,7 +937,7 @@ class VoltResponse:
         self.exception = None
         self.tables = None
 
-        if fser != None:
+        if self.fser != None:
             self.deserialize(fser)
 
     def deserialize(self, fser):
@@ -1000,7 +1006,6 @@ class VoltProcedure:
                 self.fser.writeArray(self.paramtypes[i], params[i])
             except TypeError:
                 self.fser.writeWireType(self.paramtypes[i], params[i])
-        self.fser.prependLength() # prepend the total length of the invocation
         self.fser.flush()
 
         try:
