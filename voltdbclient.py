@@ -28,6 +28,7 @@ import struct
 import datetime as _datetime
 import time
 import decimal
+from threading import Lock
 try:
     from hashlib import sha1 as sha
 except ImportError:
@@ -56,6 +57,213 @@ def if_else(cond, a, b):
 
     if cond: return a
     else: return b
+
+import asyncore
+from collections import deque
+class VoltDBClient(asyncore.dispatcher):
+    def __init__(self, host, port, username, password):
+        asyncore.dispatcher.__init__(self)
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.connect((host, port))
+
+        self.username = username
+        self.password = password
+
+        self.wbuf = deque()
+        self.rbuf = StringIO()
+        self.lbuf = StringIO()
+        self.len = 0
+
+        self.auth = False
+        self.auth_sent = False
+        self.fser = FastSerializer()
+        # Callbacks
+        self.cb = {}
+        self.handle = 0
+        self.hlock = Lock()
+
+        # Number of messages sent
+        self.sent = 0
+
+    def close(self):
+        asyncore.dispatcher.close(self)
+
+    def _authenticate(self):
+        # Requires sending a length preceded username and password even if
+        # authentication is turned off.
+
+        #protocol version
+        buf = StringIO()
+        # preceded len, fill with 0 for now
+        self.fser.writeInt32(buf, 0)
+        self.fser.writeByte(buf, 0)
+
+        # service requested
+        self.fser.writeString(buf, 'database')
+
+        if self.username:
+            # utf8 encode supplied username
+            self.fser.writeString(buf, self.username)
+        else:
+            # no username, just output length of 0
+            self.fser.writeString(buf, '')
+
+        # password supplied, sha-1 hash it
+        m = sha()
+        m.update(self.password)
+        pwHash = m.digest()
+        buf.write(pwHash)
+
+        pos = buf.tell()
+        buf.seek(0)
+        self.fser.writeInt32(buf, pos - 4)
+        buf.seek(pos)
+        self._write(buf.getvalue())
+
+    def _handle_auth(self, buf):
+        # A length, version number, and status code is returned
+        pos = 0
+        (version, pos) = self.fser.readByte(buf, pos)
+        (status, pos) = self.fser.readByte(buf, pos)
+
+        if status != 0:
+            raise SystemExit("Authentication failed.")
+
+        pos = self.fser.readInt32(buf, pos)[1]
+        pos = self.fser.readInt64(buf, pos)[1]
+        pos = self.fser.readInt64(buf, pos)[1]
+        pos = self.fser.readInt32(buf, pos)[1]
+        (l, pos) = self.fser.readInt32(buf, pos)
+        for x in xrange(l):
+            pos = self.fser.readByte(buf, pos)[1]
+
+        self.auth = True
+
+    def handle_connect(self):
+        self._authenticate()
+
+    def handle_close(self):
+        self.close()
+
+    def handle_read(self):
+        if self.len == 0:
+            assert self.lbuf.tell() == 0
+            if self._read_fixed_size(self.lbuf, 4):
+                self.len = self.fser.readInt32(self.lbuf.getvalue(), 0)[0]
+
+        if self.len == 0:
+            return None
+
+        assert self.rbuf.tell() == 0, 'Read buffer is not empty'
+        if self._read_fixed_size(self.rbuf, self.len):
+            # clear message len
+            self.len = 0
+            self.lbuf = StringIO()
+
+            if not self.auth:
+                self._handle_auth(self.rbuf.getvalue())
+            else:
+                # Call response handler
+                self._handle_response(self.rbuf.getvalue())
+            # Clear read buffer
+            self.rbuf = StringIO()
+        return None
+
+    def _handle_response(self, buf):
+        try:
+            res = VoltResponse()
+            pos = res.deserialize(self.fser, buf, 0)
+            assert pos == len(buf)
+        except IOError, err:
+            res = VoltResponse()
+            res.statusString = str(err)
+
+        # dispatch
+        self.cb[res.clientHandle](res)
+        del self.cb[res.clientHandle]
+        return None
+
+    def _read_fixed_size(self, buf, size):
+        """Read as many bytes as available into the buffer until the buffer is
+        filled with size bytes.
+
+        Return True if buf has size bytes, False otherwise
+        """
+
+        try:
+            bytes = self.recv(size - buf.tell())
+        except socket.error, e:
+            self.close()
+            return False
+
+        if len(bytes) == 0:
+            # closed on the other end
+            self.close()
+            raise Exception('Closed on the other end')
+
+        buf.write(bytes)
+        if buf.tell() == size:
+            return True
+        else:
+            return False
+
+    # def writable(self):
+    #     return (len(self.wbuf) > 0)
+
+    def handle_write(self):
+        if len(self.wbuf) == 0:
+            return
+        if self.auth_sent and not self.auth:
+            return
+        self.auth_sent = True
+        data = buffer(self.wbuf[0][0], self.wbuf[0][1],
+                      len(self.wbuf[0][0]) - self.wbuf[0][1])
+        sent = self.send(data)
+        self.wbuf[0][1] += sent
+        if self.wbuf[0][1] == len(self.wbuf[0][0]):
+            self.wbuf.popleft()
+        self.sent += 1
+        return None
+
+    def call(self, cb, name, types = [], params = None):
+        """Call procedure
+        """
+
+        self.hlock.acquire()
+        queued = len(self.cb)
+        self.hlock.release()
+
+        # See if we have back pressure
+        if queued == 3000:
+            return False
+
+        self.hlock.acquire()
+        handle = self.handle
+        self.handle += 1
+        self.cb[handle] = cb
+        self.hlock.release()
+
+        proc = VoltProcedure(name, types)
+        buf = StringIO()
+        self.fser.writeInt32(buf, 0)
+        proc.serialize(self.fser, buf, handle, params)
+
+        pos = buf.tell()
+        buf.seek(0)
+        self.fser.writeInt32(buf, pos - 4)
+
+        self._write(buf.getvalue())
+
+        return True
+
+    def _write(self, bytes):
+        """Write bytes to the write buffer
+        """
+
+        if len(bytes) == 0:
+            return None
+
+        return self.wbuf.append([bytes, 0])
 
 class FastSerializer:
     "Primitive type de/serialization in VoltDB formats"
@@ -100,25 +308,7 @@ class FastSerializer:
     # if these assumptions are not true. it is further assumed
     # that host order is little endian. See isNaN().
 
-    def __init__(self, host = None, port = 21212, username = "",
-                 password = "", dump_file = 'dump'):
-        # connect a socket to host, port and get a file object
-        self.wbuf = StringIO()
-        self.rbuf = ""
-        self.offset = 0
-        self.host = host
-        self.port = port
-        self.dump_file = None
-        if dump_file != None:
-            self.dump_file = open(dump_file, "wb")
-
-        self.socket = None
-        if self.host != None and self.port != None:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setblocking(1)
-            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.socket.connect((self.host, self.port))
-
+    def __init__(self):
         # input can be big or little endian
         self.inputBOM = self.BIG_ENDIAN  # byte order if input stream
         self.localBOM = self.LITTLE_ENDIAN  # byte order of host
@@ -157,7 +347,6 @@ class FastSerializer:
                              self.VOLTTYPE_DECIMAL_STRING: self.readDecimalStringArray}
 
         self.__compileStructs()
-        self.offset = 0
 
         # Check if the value of a given type is NULL
         self.NULL_DECIMAL_INDICATOR = \
@@ -197,9 +386,6 @@ class FastSerializer:
                               if_else(x == self.NULL_DECIMAL_INDICATOR,
                                       None, x)}
 
-        if username != None and password != None and host != None:
-            self.authenticate(username, password)
-
     def __compileStructs(self):
         # Compiled structs for each type
         self.byteType = lambda length : '%c%db' % (self.inputBOM, length)
@@ -212,51 +398,6 @@ class FastSerializer:
         self.stringType = lambda length : '%c%ds' % (self.inputBOM, length)
         self.varbinaryType = lambda length : '%c%ds' % (self.inputBOM, length)
 
-    def close(self):
-        if self.dump_file != None:
-            self.dump_file.close()
-        self.socket.close()
-
-    def authenticate(self, username, password):
-        # Requires sending a length preceded username and password even if
-        # authentication is turned off.
-
-        #protocol version
-        self.writeByte(0)
-
-        # service requested
-        self.writeString("database")
-
-        if username:
-            # utf8 encode supplied username
-            self.writeString(username)
-        else:
-            # no username, just output length of 0
-            self.writeString("")
-
-        # password supplied, sha-1 hash it
-        m = sha()
-        m.update(password)
-        pwHash = m.digest()
-        self.wbuf.write(pwHash)
-
-        self.flush()
-
-        # A length, version number, and status code is returned
-        self.bufferForRead()
-        version = self.readByte()
-        status = self.readByte()
-
-        if status != 0:
-            raise SystemExit("Authentication failed.")
-
-        self.readInt32()
-        self.readInt64()
-        self.readInt64()
-        self.readInt32()
-        for x in range(self.readInt32()):
-            self.readByte()
-
     def setInputByteOrder(self, bom):
         # assuming bom is high bit set?
         if bom == 1:
@@ -267,110 +408,46 @@ class FastSerializer:
         # recompile the structs
         self.__compileStructs()
 
-    def getLength(self):
-        # write 32 bit array length at offset 0, NOT including the
-        # size of this length preceding value. This value is written
-        # in the network order.
-        ttllen = self.wbuf.tell()
-        lenBytes = struct.pack(self.inputBOM + 'i', ttllen)
-        return lenBytes
-
-    def size(self):
-        """Returns the size of the write buffer.
-        """
-
-        return (self.wbuf.tell())
-
-    def flush(self):
-        if self.socket == None:
-            print "ERROR: not connected to server."
-            exit(-1)
-
-        if self.dump_file != None and False:
-            self.dump_file.write(self.wbuf.getvalue())
-            self.dump_file.write("\n")
-        self.socket.sendall(self.getLength())
-        self.socket.sendall(self.wbuf.getvalue())
-        self.wbuf = StringIO()
-        return None
-
-    def bufferForRead(self):
-        if self.socket == None:
-            print "ERROR: not connected to server."
-            exit(-1)
-
-        # fully buffer a new length preceded message from socket
-        # read the length. the read until the buffer is completed.
-        responseprefix = ""
-        while (len(responseprefix) < 4):
-            responseprefix += self.socket.recv(4 - len(responseprefix))
-            if responseprefix == "":
-                raise IOError("Connection broken")
-        if self.dump_file != None:
-            self.dump_file.write(responseprefix)
-        responseLength = struct.unpack(self.int32Type(1), responseprefix)[0]
-        r = StringIO()
-        while (r.tell() < responseLength):
-            r.write(self.socket.recv(responseLength - r.tell()))
-        self.rbuf = r.getvalue()
-        self.offset = 0
-        if self.dump_file != None:
-            self.dump_file.write(self.rbuf)
-            self.dump_file.write("\n")
-        return None
-
-    def read(self, type):
+    def read(self, buf, pos, type):
         if type not in self.READER:
             print "ERROR: can't read wire type(", type, ") yet."
             exit(-2)
 
-        return self.READER[type]()
+        return self.READER[type](buf, pos)
 
-    def write(self, type, value):
+    def write(self, buf, type, value):
         if type not in self.WRITER:
             print "ERROR: can't write wire type(", type, ") yet."
             exit(-2)
 
-        return self.WRITER[type](value)
+        return self.WRITER[type](buf, value)
 
-    def readWireType(self):
-        type = self.readByte()
-        return self.read(type)
+    def readWireType(self, buf, pos):
+        (type, pos) = self.readByte(buf, pos)
+        return self.read(buf, pos, type)
 
-    def writeWireType(self, type, value):
+    def writeWireType(self, buf, type, value):
         if type not in self.WRITER:
             print "ERROR: can't write wire type(", type, ") yet."
             exit(-2)
 
-        self.writeByte(type)
-        return self.write(type, value)
+        self.writeByte(buf, type)
+        return self.write(buf, type, value)
 
-    def getRawBytes(self):
-        return self.wbuf
-
-    def writeRawBytes(self, value):
-        """Appends the given raw bytes to the end of the write buffer.
-        """
-
-        return self.wbuf.write(value)
-
-    def __str__(self):
-        return repr(self.wbuf)
-
-    def readArray(self, type):
+    def readArray(self, buf, pos, type):
         if type not in self.ARRAY_READER:
             print "ERROR: can't read wire type(", type, ") yet."
             exit(-2)
 
-        return self.ARRAY_READER[type]()
+        return self.ARRAY_READER[type](buf, pos)
 
-    def readNull(self):
-        return None
+    def readNull(self, buf, pos):
+        return (None, pos)
 
-    def writeNull(self, value):
+    def writeNull(self, buf, value):
         return
 
-    def writeArray(self, type, array):
+    def writeArray(self, buf, type, array):
         if (not array) or (len(array) == 0) or (not type):
             return
 
@@ -381,135 +458,130 @@ class FastSerializer:
         # serialize arrays of bytes as larger values to support
         # strings and varbinary input
         if type != FastSerializer.VOLTTYPE_TINYINT:
-            self.writeInt16(len(array))
+            self.writeInt16(buf, len(array))
         else:
-            self.writeInt32(len(array))
+            self.writeInt32(buf, len(array))
 
         for i in array:
-            self.WRITER[type](i)
+            self.WRITER[type](buf, i)
 
-    def writeWireTypeArray(self, type, array):
+    def writeWireTypeArray(self, buf, type, array):
         if type not in self.ARRAY_READER:
             print "ERROR: can't write wire type(", type, ") yet."
             exit(-2)
 
-        self.writeByte(type)
-        return self.writeArray(type, array)
+        self.writeByte(buf, type)
+        return self.writeArray(buf, type, array)
 
     # byte
-    def readByteArrayContent(self, cnt):
-        offset = self.offset + cnt
-        val = struct.unpack(self.byteType(cnt), self.rbuf[self.offset:offset])
-        self.offset = offset
-        return val
+    def readByteArrayContent(self, buf, pos, cnt):
+        offset = pos + cnt
+        val = struct.unpack(self.byteType(cnt), buf[pos:offset])
+        return (val, offset)
 
-    def readByteArray(self):
-        length = self.readInt32()
-        val = self.readByteArrayContent(length)
+    def readByteArray(self, buf, pos):
+        (length, pos) = self.readInt32(buf, pos)
+        (val, pos) = self.readByteArrayContent(buf, pos, length)
         val = map(self.NullCheck[self.VOLTTYPE_TINYINT], val)
-        return val
+        return (val, pos)
 
-    def readByte(self):
-        val = self.readByteArrayContent(1)[0]
-        return self.NullCheck[self.VOLTTYPE_TINYINT](val)
+    def readByte(self, buf, pos):
+        (val, pos) = self.readByteArrayContent(buf, pos, 1)
+        return (self.NullCheck[self.VOLTTYPE_TINYINT](val[0]), pos)
 
-    def writeByte(self, value):
+    def writeByte(self, buf, value):
         if value == None:
             val = self.__class__.NULL_TINYINT_INDICATOR
         else:
             val = value
-        return self.wbuf.write(struct.pack(self.byteType(1), val))
+        return buf.write(struct.pack(self.byteType(1), val))
 
     # int16
-    def readInt16ArrayContent(self, cnt):
-        offset = self.offset + cnt * 2
-        val = struct.unpack(self.int16Type(cnt), self.rbuf[self.offset:offset])
-        self.offset = offset
-        return val
+    def readInt16ArrayContent(self, buf, pos, cnt):
+        offset = pos + cnt * 2
+        val = struct.unpack(self.int16Type(cnt), buf[pos:offset])
+        return (val, offset)
 
-    def readInt16Array(self):
-        length = self.readInt16()
-        val = self.readInt16ArrayContent(length)
+    def readInt16Array(self, buf, pos):
+        (length, pos) = self.readInt16(buf, pos)
+        (val, pos) = self.readInt16ArrayContent(buf, pos, length)
         val = map(self.NullCheck[self.VOLTTYPE_SMALLINT], val)
-        return val
+        return (val, pos)
 
-    def readInt16(self):
-        val = self.readInt16ArrayContent(1)[0]
-        return self.NullCheck[self.VOLTTYPE_SMALLINT](val)
+    def readInt16(self, buf, pos):
+        (val, pos) = self.readInt16ArrayContent(buf, pos, 1)
+        return (self.NullCheck[self.VOLTTYPE_SMALLINT](val[0]), pos)
 
-    def writeInt16(self, value):
+    def writeInt16(self, buf, value):
         if value == None:
             val = self.__class__.NULL_SMALLINT_INDICATOR
         else:
             val = value
-        return self.wbuf.write(struct.pack(self.int16Type(1), val))
+        return buf.write(struct.pack(self.int16Type(1), val))
 
     # int32
-    def readInt32ArrayContent(self, cnt):
-        offset = self.offset + cnt * 4
-        val = struct.unpack(self.int32Type(cnt), self.rbuf[self.offset:offset])
-        self.offset = offset
-        return val
+    def readInt32ArrayContent(self, buf, pos, cnt):
+        offset = pos + cnt * 4
+        val = struct.unpack(self.int32Type(cnt), buf[pos:offset])
+        return (val, offset)
 
-    def readInt32Array(self):
-        length = self.readInt16()
-        val = self.readInt32ArrayContent(length)
+    def readInt32Array(self, buf, pos):
+        (length, pos) = self.readInt16(buf, pos)
+        (val, pos) = self.readInt32ArrayContent(buf, pos, length)
         val = map(self.NullCheck[self.VOLTTYPE_INTEGER], val)
-        return val
+        return (val, pos)
 
-    def readInt32(self):
-        val = self.readInt32ArrayContent(1)[0]
-        return self.NullCheck[self.VOLTTYPE_INTEGER](val)
+    def readInt32(self, buf, pos):
+        (val, pos) = self.readInt32ArrayContent(buf, pos, 1)
+        return (self.NullCheck[self.VOLTTYPE_INTEGER](val[0]), pos)
 
-    def writeInt32(self, value):
+    def writeInt32(self, buf, value):
         if value == None:
             val = self.__class__.NULL_INTEGER_INDICATOR
         else:
             val = value
-        return self.wbuf.write(struct.pack(self.int32Type(1), val))
+        return buf.write(struct.pack(self.int32Type(1), val))
 
     # int64
-    def readInt64ArrayContent(self, cnt):
-        offset = self.offset + cnt * 8
-        val = struct.unpack(self.int64Type(cnt), self.rbuf[self.offset:offset])
-        self.offset = offset
-        return val
+    def readInt64ArrayContent(self, buf, pos, cnt):
+        offset = pos + cnt * 8
+        val = struct.unpack(self.int64Type(cnt), buf[pos:offset])
+        return (val, offset)
 
-    def readInt64Array(self):
-        length = self.readInt16()
-        val = self.readInt64ArrayContent(length)
+    def readInt64Array(self, buf, pos):
+        (length, pos) = self.readInt16(buf, pos)
+        (val, pos) = self.readInt64ArrayContent(buf, pos, length)
         val = map(self.NullCheck[self.VOLTTYPE_BIGINT], val)
-        return val
+        return (val, pos)
 
-    def readInt64(self):
-        val = self.readInt64ArrayContent(1)[0]
-        return self.NullCheck[self.VOLTTYPE_BIGINT](val)
+    def readInt64(self, buf, pos):
+        (val, pos) = self.readInt64ArrayContent(buf, pos, 1)
+        return (self.NullCheck[self.VOLTTYPE_BIGINT](val[0]), pos)
 
-    def writeInt64(self, value):
+    def writeInt64(self, buf, value):
         if value == None:
             val = self.__class__.NULL_BIGINT_INDICATOR
         else:
             val = value
-        return self.wbuf.write(struct.pack(self.int64Type(1), val))
+        return buf.write(struct.pack(self.int64Type(1), val))
 
     # float64
-    def readFloat64ArrayContent(self, cnt):
-        offset = self.offset + cnt * 8
-        val = struct.unpack(self.float64Type(cnt), self.rbuf[self.offset:offset])
-        self.offset = offset
-        return val
+    def readFloat64ArrayContent(self, buf, pos, cnt):
+        offset = pos + cnt * 8
+        val = struct.unpack(self.float64Type(cnt), buf[pos:offset])
+        return (val, offset)
 
-    def readFloat64Array(self):
-        length = self.readInt16()
-        val = self.readFloat64ArrayContent(length)
+    def readFloat64Array(self, buf, pos):
+        (length, pos) = self.readInt16(buf, pos)
+        (val, pos) = self.readFloat64ArrayContent(buf, pos, length)
         val = map(self.NullCheck[self.VOLTTYPE_FLOAT], val)
-        return val
+        return (val, pos)
 
-    def readFloat64(self):
-        val = self.readFloat64ArrayContent(1)[0]
-        return self.NullCheck[self.VOLTTYPE_FLOAT](val)
+    def readFloat64(self, buf, pos):
+        (val, pos) = self.readFloat64ArrayContent(buf, pos, 1)
+        return (self.NullCheck[self.VOLTTYPE_FLOAT](val), pos)
 
-    def writeFloat64(self, value):
+    def writeFloat64(self, buf, value):
         if value == None:
             val = self.__class__.NULL_FLOAT_INDICATOR
         else:
@@ -518,82 +590,81 @@ class FastSerializer:
         tmp = array.array("d", [val])
         if self.inputBOM != self.localBOM:
             tmp.byteswap()
-        return self.wbuf.write(tmp.tostring())
+        return buf.write(tmp.tostring())
 
     # string
-    def readStringContent(self, cnt):
+    def readStringContent(self, buf, pos, cnt):
         if cnt == 0:
-            return ""
+            return ('', pos)
 
-        offset = self.offset + cnt
-        val = struct.unpack(self.stringType(cnt), self.rbuf[self.offset:offset])
-        self.offset = offset
-        return val[0].decode("utf-8")
+        offset = pos + cnt
+        val = struct.unpack(self.stringType(cnt), buf[pos:offset])
+        return (val[0].decode("utf-8"), offset)
 
-    def readString(self):
+    def readString(self, buf, pos):
         # length preceeded (4 byte value) string
-        length = self.readInt32()
+        (length, pos) = self.readInt32(buf, pos)
         if self.NullCheck[self.VOLTTYPE_STRING](length) == None:
-            return None
-        return self.readStringContent(length)
+            return (None, pos)
+        return self.readStringContent(buf, pos, length)
 
-    def readStringArray(self):
+    def readStringArray(self, buf, pos):
         retval = []
-        cnt = self.readInt16()
+        (cnt, pos) = self.readInt16(buf, pos)
 
         for i in xrange(cnt):
-            retval.append(self.readString())
+            (s, pos) = self.readString(buf, pos)
+            retval.append(s)
 
-        return tuple(retval)
+        return (tuple(retval), pos)
 
-    def writeString(self, value):
+    def writeString(self, buf, value):
         if value is None:
-            self.writeInt32(self.NULL_STRING_INDICATOR)
-            return
+            self.writeInt32(buf, self.NULL_STRING_INDICATOR)
+            return None
 
         encoded_value = value.encode("utf-8")
-        self.writeInt32(len(encoded_value))
-        return self.wbuf.write(encoded_value)
+        self.writeInt32(buf, len(encoded_value))
+        return buf.write(encoded_value)
 
     # varbinary
-    def readVarbinaryContent(self, cnt):
+    def readVarbinaryContent(self, buf, pos, cnt):
         if cnt == 0:
-            return array.array('c', [])
+            return (array.array('c', []), pos)
 
-        offset = self.offset + cnt
-        val = struct.unpack(self.varbinaryType(cnt), self.rbuf[self.offset:offset])
-        self.offset = offset
-        return array.array('c', val[0])
+        offset = pos + cnt
+        val = struct.unpack(self.varbinaryType(cnt), buf[pos:offset])
+        return (array.array('c', val[0]), offset)
 
-    def readVarbinary(self):
+    def readVarbinary(self, buf, pos):
         # length preceeded (4 byte value) string
-        length = self.readInt32()
+        (length, pos) = self.readInt32(buf, pos)
         if self.NullCheck[self.VOLTTYPE_VARBINARY](length) == None:
-            return None
-        return self.readVarbinaryContent(length)
+            return (None, pos)
+        return self.readVarbinaryContent(buf, pos, length)
 
-    def writeVarbinary(self, value):
+    def writeVarbinary(self, buf, value):
         if value is None:
-            self.writeInt32(self.NULL_STRING_INDICATOR)
-            return
+            self.writeInt32(buf, self.NULL_STRING_INDICATOR)
+            return None
 
-        self.writeInt32(len(value))
-        return self.wbuf.write(value)
+        self.writeInt32(buf, len(value))
+        return buf.write(value)
 
     # date
     # The timestamp we receive from the server is a 64-bit integer representing
     # microseconds since the epoch. It will be converted to a datetime object in
     # the local timezone.
-    def readDate(self):
-        raw = self.readInt64()
+    def readDate(self, buf, pos):
+        (raw, pos) = self.readInt64(buf, pos)
         if raw == None:
-            return None
+            return (None, pos)
         # microseconds before or after Jan 1, 1970 UTC
-        return _datetime.datetime.fromtimestamp(raw/1000000.0)
+        return (_datetime.datetime.fromtimestamp(raw/1000000.0), pos)
 
-    def readDateArray(self):
+    def readDateArray(self, buf, pos):
         retval = []
-        raw = self.readInt64Array()
+        (raw, pos) = self.readInt64Array(buf, pos)
 
         for i in raw:
             val = None
@@ -601,23 +672,21 @@ class FastSerializer:
                 val = _datetime.datetime.fromtimestamp(i/1000000.0)
             retval.append(val)
 
-        return tuple(retval)
+        return (tuple(retval), pos)
 
-    def writeDate(self, value):
+    def writeDate(self, buf, value):
         if value is None:
             val = self.__class__.NULL_BIGINT_INDICATOR
         else:
             seconds = int(value.strftime("%s"))
             val = seconds * 1000000 + value.microsecond
-        return self.wbuf.write(struct.pack(self.int64Type(1), val))
+        return buf.write(struct.pack(self.int64Type(1), val))
 
-    def readDecimal(self):
-        offset = self.offset + 16
-        if self.NullCheck[self.VOLTTYPE_DECIMAL](self.rbuf[self.offset:offset]) == None:
-            self.offset = offset
-            return None
-        val = list(struct.unpack(self.ubyteType(16), self.rbuf[self.offset:offset]))
-        self.offset = offset
+    def readDecimal(self, buf, pos):
+        offset = pos + 16
+        if self.NullCheck[self.VOLTTYPE_DECIMAL](buf[pos:offset]) == None:
+            return (None, offset)
+        val = list(struct.unpack(self.ubyteType(16), buf[pos:offset]))
         mostSignificantBit = 1 << 7
         isNegative = (val[0] & mostSignificantBit) != 0
         unscaledValue = -(val[0] & mostSignificantBit) << 120
@@ -628,20 +697,22 @@ class FastSerializer:
         for x in xrange(16):
             unscaledValue += val[x] << ((15 - x) * 8)
         unscaledValue = map(lambda x: int(x), str(abs(unscaledValue)))
-        return decimal.Decimal((isNegative, tuple(unscaledValue),
-                                -self.__class__.DEFAULT_DECIMAL_SCALE))
+        return (decimal.Decimal((isNegative, tuple(unscaledValue),
+                                 -self.__class__.DEFAULT_DECIMAL_SCALE)),
+                offset)
 
-    def readDecimalArray(self):
+    def readDecimalArray(self, buf, pos):
         retval = []
-        cnt = self.readInt16()
+        (cnt, pos) = self.readInt16(buf, pos)
         for i in xrange(cnt):
-            retval.append(self.readDecimal())
-        return tuple(retval)
+            (val, pos) = self.readDecimal(buf, pos)
+            retval.append(val)
+        return (tuple(retval), pos)
 
-    def readDecimalString(self):
-        encoded_string = self.readString()
+    def readDecimalString(self, buf, pos):
+        (encoded_string, pos) = self.readString(buf, pos)
         if encoded_string == None:
-            return None
+            return (None, pos)
         val = decimal.Decimal(encoded_string)
         (sign, digits, exponent) = val.as_tuple()
         if -exponent > self.__class__.DEFAULT_DECIMAL_SCALE:
@@ -650,14 +721,15 @@ class FastSerializer:
         if len(digits) > 38:
             raise ValueError("Precision of this decimal is %d and the max is 38"
                              % (len(digits)))
-        return val
+        return (val, pos)
 
-    def readDecimalStringArray(self):
+    def readDecimalStringArray(self, buf, pos):
         retval = []
-        cnt = self.readInt16()
+        (cnt, pos) = self.readInt16(buf, pos)
         for i in xrange(cnt):
-            retval.append(self.readDecimalString())
-        return tuple(retval)
+            (val, pos) = self.readDecimalString(buf, pos)
+            retval.append(val)
+        return (tuple(retval), pos)
 
     def __intToBytes(self, value, sign):
         value_bytes = ""
@@ -686,10 +758,9 @@ class FastSerializer:
         ret += value_bytes
         return ret
 
-    def writeDecimal(self, num):
+    def writeDecimal(self, buf, pos, num):
         if num is None:
-            self.wbuf.write(self.NULL_DECIMAL_INDICATOR)
-            return
+            return buf.write(self.NULL_DECIMAL_INDICATOR)
         if not isinstance(num, decimal.Decimal):
             raise TypeError("num must be of the type decimal.Decimal")
         (sign, digits, exponent) = num.as_tuple()
@@ -705,29 +776,25 @@ class FastSerializer:
         scale_factor = self.__class__.DEFAULT_DECIMAL_SCALE - scale
         unscaled_int = int(decimal.Decimal((0, digits, scale_factor)))
         data = self.__intToBytes(unscaled_int, sign)
-        return self.wbuf.write(data)
+        return buf.write(data)
 
-    def writeDecimalString(self, num):
+    def writeDecimalString(self, buf, num):
         if num is None:
-            self.writeString(None)
-            return
+            return self.writeString(buf, None)
         if not isinstance(num, decimal.Decimal):
             raise TypeError("num must be of type decimal.Decimal")
-        return self.writeString(num.to_eng_string())
+        return self.writeString(buf, num.to_eng_string())
 
     # cash!
-    def readMoney(self):
+    def readMoney(self, buf, pos):
         # money-unit * 10,000
-        return self.readInt64()
+        return self.readInt64(buf, pos)
 
 class VoltColumn:
     "definition of one VoltDB table column"
-    def __init__(self, fser = None, type = None, name = None):
-        if fser != None:
-            self.type = fser.readByte()
-        elif type != None and name != None:
-            self.type = type
-            self.name = name
+    def __init__(self, type = None, name = None):
+        self.type = type
+        self.name = name
 
     def __str__(self):
         # If the name is empty, use the default "modified tuples". Has to do
@@ -744,19 +811,20 @@ class VoltColumn:
             return True
         return (self.type == other.type and self.name == other.name)
 
-    def readName(self, fser):
-        self.name = fser.readString()
+    def deserialize(self, fser, buf, pos):
+        (self.type, pos) = fser.readByte(buf, pos)
+        (self.name, pos) = fser.readString(buf, pos)
+        return pos
 
-    def writeType(self, fser):
-        fser.writeByte(self.type)
+    # def writeType(self, fser):
+    #     fser.writeByte(self.type)
 
-    def writeName(self, fser):
-        fser.writeString(self.name)
+    # def writeName(self, fser):
+    #     fser.writeString(self.name)
 
 class VoltTable:
     "definition and content of one VoltDB table"
-    def __init__(self, fser):
-        self.fser = fser
+    def __init__(self):
         self.columns = []  # column defintions
         self.tuples = []
 
@@ -779,7 +847,6 @@ class VoltTable:
         return (self.columns, self.tuples)
 
     def __setstate__(self, state):
-        self.fser = None
         self.columns, self.tuples = state
 
     def __eq__(self, other):
@@ -799,56 +866,59 @@ class VoltTable:
     # 3. Read the tuples count.
     #    a. read the row count
     #    b. read tuples recording string lengths
-    def readFromSerializer(self):
+    def deserialize(self, fser, buf, pos):
         # 1.
-        tablesize = self.fser.readInt32()
+        (tablesize, pos) = fser.readInt32(buf, pos)
         # 2.
-        headersize = self.fser.readInt32()
-        statuscode = self.fser.readByte()
-        columncount = self.fser.readInt16()
+        (headersize, pos) = fser.readInt32(buf, pos)
+        (statuscode, pos) = fser.readByte(buf, pos)
+        (columncount, pos) = fser.readInt16(buf, pos)
         for i in xrange(columncount):
-            column = VoltColumn(fser = self.fser)
+            column = VoltColumn()
             self.columns.append(column)
-        map(lambda x: x.readName(self.fser), self.columns)
+        for c in self.columns:
+            pos = c.deserialize(fser, buf, pos)
 
         # 3.
-        rowcount = self.fser.readInt32()
+        (rowcount, pos) = fser.readInt32(buf, pos)
         for i in xrange(rowcount):
-            rowsize = self.fser.readInt32()
+            (rowsize, pos) = fser.readInt32(buf, pos)
             # list comprehension: build list by calling read for each column in
             # row/tuple
-            row = [self.fser.read(self.columns[j].type)
-                   for j in xrange(columncount)]
+            row = []
+            for j in xrange(columncount):
+                (col, pos) = fser.read(buf, pos, self.columns[j].type)
+                row.append(col)
             self.tuples.append(row)
 
-        return self
+        return pos
 
-    def writeToSerializer(self):
-        table_fser = FastSerializer()
+    # def writeToSerializer(self):
+    #     table_fser = FastSerializer()
 
-        # We have to pack the header into a buffer first so that we can
-        # calculate the size
-        header_fser = FastSerializer()
+    #     # We have to pack the header into a buffer first so that we can
+    #     # calculate the size
+    #     header_fser = FastSerializer()
 
-        header_fser.writeByte(0)
-        header_fser.writeInt16(len(self.columns))
-        map(lambda x: x.writeType(header_fser), self.columns)
-        map(lambda x: x.writeName(header_fser), self.columns)
+    #     header_fser.writeByte(0)
+    #     header_fser.writeInt16(len(self.columns))
+    #     map(lambda x: x.writeType(header_fser), self.columns)
+    #     map(lambda x: x.writeName(header_fser), self.columns)
 
-        table_fser.writeInt32(header_fser.size() - 4)
-        table_fser.writeRawBytes(header_fser.getRawBytes())
+    #     table_fser.writeInt32(header_fser.size() - 4)
+    #     table_fser.writeRawBytes(header_fser.getRawBytes())
 
-        table_fser.writeInt32(len(self.tuples))
-        for i in self.tuples:
-            row_fser = FastSerializer()
+    #     table_fser.writeInt32(len(self.tuples))
+    #     for i in self.tuples:
+    #         row_fser = FastSerializer()
 
-            map(lambda x: row_fser.write(self.columns[x].type, i[x]),
-                xrange(len(i)))
+    #         map(lambda x: row_fser.write(self.columns[x].type, i[x]),
+    #             xrange(len(i)))
 
-            table_fser.writeInt32(row_fser.size())
-            table_fser.writeRawBytes(row_fser.getRawBytes())
+    #         table_fser.writeInt32(row_fser.size())
+    #         table_fser.writeRawBytes(row_fser.getRawBytes())
 
-        self.fser.writeRawBytes(table_fser.getRawBytes())
+    #     fser.writeRawBytes(table_fser.getRawBytes())
 
 
 class VoltException:
@@ -859,28 +929,26 @@ class VoltException:
     VOLTEXCEPTION_CONSTRAINTFAILURE = 3
     VOLTEXCEPTION_GENERIC = 4
 
-    def __init__(self, fser):
+    def __init__(self):
         self.type = self.VOLTEXCEPTION_NONE
         self.typestr = "None"
         self.message = ""
 
-        if fser != None:
-            self.deserialize(fser)
-
-    def deserialize(self, fser):
-        self.length = fser.readInt32()
+    def deserialize(self, fser, buf, pos):
+        (self.length, pos) = fser.readInt32(buf, pos)
         if self.length == 0:
             self.type = self.VOLTEXCEPTION_NONE
-            return
-        self.type = fser.readByte()
+            return pos
+        (self.type, pos) = fser.readByte(buf, pos)
         # quick and dirty exception skipping
         if self.type == self.VOLTEXCEPTION_NONE:
-            return
+            return pos
 
         self.message = []
-        self.message_len = fser.readInt32()
+        (self.message_len, pos) = fser.readInt32(buf, pos)
         for i in xrange(0, self.message_len):
-            self.message.append(chr(fser.readByte()))
+            (b, pos) = fser.readByte(buf, pos)
+            self.message.append(chr(b))
         self.message = ''.join(self.message)
 
         if self.type == self.VOLTEXCEPTION_GENERIC:
@@ -888,28 +956,32 @@ class VoltException:
         elif self.type == self.VOLTEXCEPTION_EEEXCEPTION:
             self.typestr = "EE Exception"
             # serialized size from EEException.java is 4 bytes
-            self.error_code = fser.readInt32()
+            (self.error_code, pos) = fser.readInt32(buf, pos)
         elif self.type == self.VOLTEXCEPTION_SQLEXCEPTION or \
                 self.type == self.VOLTEXCEPTION_CONSTRAINTFAILURE:
             self.sql_state_bytes = []
             for i in xrange(0, 5):
-                self.sql_state_bytes.append(chr(fser.readByte()))
+                (b, pos) = fser.readByte(buf, pos)
+                self.sql_state_bytes.append(chr(b))
             self.sql_state_bytes = ''.join(self.sql_state_bytes)
 
             if self.type == self.VOLTEXCEPTION_SQLEXCEPTION:
                 self.typestr = "SQL Exception"
             else:
                 self.typestr = "Constraint Failure"
-                self.constraint_type = fser.readInt32()
-                self.table_name = fser.readString()
-                self.buffer_size = fser.readInt32()
+                (self.constraint_type, pos) = fser.readInt32(buf, pos)
+                (self.table_name, pos) = fser.readString(buf, pos)
+                (self.buffer_size, pos) = fser.readInt32(buf, pos)
                 self.buffer = []
                 for i in xrange(0, self.buffer_size):
-                    self.buffer.append(fser.readByte())
+                    (b, pos) = fser.readByte(buf, pos)
+                    self.buffer.append(b)
         else:
             for i in xrange(0, self.length - 3 - 2 - self.message_len):
-                fser.readByte()
+                pos = fser.readByte(buf, pos)[1]
             print "Python client deserialized unknown VoltException."
+
+        return pos
 
     def __str__(self):
         msgstr = "VoltException: type: %s\n" % self.typestr
@@ -925,8 +997,7 @@ class VoltException:
 
 class VoltResponse:
     "VoltDB called procedure response (ClientResponse.java)"
-    def __init__(self, fser):
-        self.fser = fser
+    def __init__(self):
         self.version = -1
         self.clientHandle = -1
         self.status = -1
@@ -937,38 +1008,38 @@ class VoltResponse:
         self.exception = None
         self.tables = None
 
-        if self.fser != None:
-            self.deserialize(fser)
-
-    def deserialize(self, fser):
+    def deserialize(self, fser, buf, pos):
         # serialization order: response-length, status, roundtripTime, exception,
         # tables[], info, id.
-        fser.bufferForRead()
-        self.version = fser.readByte()
-        self.clientHandle = fser.readInt64()
-        presentFields = fser.readByte();
-        self.status = fser.readByte()
+        (self.version, pos) = fser.readByte(buf, pos)
+        (self.clientHandle, pos) = fser.readInt64(buf, pos)
+        (presentFields, pos) = fser.readByte(buf, pos);
+        (self.status, pos) = fser.readByte(buf, pos)
         if presentFields & (1 << 5) != 0:
-            self.statusString = fser.readString()
+            (self.statusString, pos) = fser.readString(buf, pos)
         else:
             self.statusString = None
-        self.appStatus = fser.readByte()
+        (self.appStatus, pos) = fser.readByte(buf, pos)
         if presentFields & (1 << 7) != 0:
-            self.appStatusString = fser.readString()
+            (self.appStatusString, pos) = fser.readString(buf, pos)
         else:
             self.appStatusString = None
-        self.roundtripTime = fser.readInt32()
+        (self.roundtripTime, pos) = fser.readInt32(buf, pos)
         if presentFields & (1 << 6) != 0:
-            self.exception = VoltException(fser)
+            self.exception = VoltException()
+            pos = self.exception.deserialize(fser, buf, pos)
         else:
             self.exception = None
 
         # tables[]
-        tablecount = fser.readInt16()
+        (tablecount, pos) = fser.readInt16(buf, pos)
         self.tables = []
         for i in xrange(tablecount):
-            table = VoltTable(fser)
-            self.tables.append(table.readFromSerializer())
+            table = VoltTable()
+            pos = table.deserialize(fser, buf, pos)
+            self.tables.append(table)
+
+        return pos
 
     def __str__(self):
         tablestr = "\n\n".join([str(i) for i in self.tables])
@@ -985,33 +1056,20 @@ class VoltResponse:
 
 class VoltProcedure:
     "VoltDB called procedure interface"
-    def __init__(self, fser, name, paramtypes = []):
-        self.fser = fser             # FastSerializer object
+    def __init__(self, name, paramtypes = []):
         self.name = name             # procedure class name
         self.paramtypes = paramtypes # list of fser.WIRE_* values
 
-    def call(self, params = None, response = True, timeout = None):
-        self.fser.writeByte(0)  # version number
-        self.fser.writeString(self.name)
-        self.fser.writeInt64(1)            # client handle
-        self.fser.writeInt16(len(self.paramtypes))
+    def serialize(self, fser, buf, handle, params = None):
+        fser.writeByte(buf, 0)  # version number
+        fser.writeString(buf, self.name)
+        fser.writeInt64(buf, handle)            # client handle
+        fser.writeInt16(buf, len(self.paramtypes))
         for i in xrange(len(self.paramtypes)):
-            try:
-                iter(params[i]) # Test if this is an array
-                if isinstance(params[i], basestring): # String is a special case
-                    raise TypeError
-
-                self.fser.writeByte(FastSerializer.ARRAY)
-                self.fser.writeByte(self.paramtypes[i])
-                self.fser.writeArray(self.paramtypes[i], params[i])
-            except TypeError:
-                self.fser.writeWireType(self.paramtypes[i], params[i])
-        self.fser.flush()
-
-        try:
-            self.fser.socket.settimeout(timeout) # timeout exception will be raised
-            res = VoltResponse(self.fser)
-        except IOError, err:
-            res = VoltResponse(None)
-            res.statusString = str(err)
-        return response and res or None
+            if hasattr(params[i], '__iter__'):
+                fser.writeByte(buf, FastSerializer.ARRAY)
+                fser.writeByte(buf, self.paramtypes[i])
+                fser.writeArray(buf, self.paramtypes[i], params[i])
+            else:
+                fser.writeWireType(buf, self.paramtypes[i], params[i])
+        return buf
