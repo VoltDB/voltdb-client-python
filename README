@@ -18,12 +18,12 @@ table shows the mapping.
    +------------------+
    |VoltDB   |Python  |
    |---------|--------|
-   |NULL     |None	  |
+   |NULL     |None    |
    |TINYINT  |integer |
    |SMALLINT |integer |
    |INTEGER  |integer |
    |BIGINT   |integer |
-   |FLOAT    |float	  |
+   |FLOAT    |float   |
    |STRING   |string  |
    |DECIMAL  |decimal |
    +------------------+

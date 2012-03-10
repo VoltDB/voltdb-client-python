@@ -83,7 +83,7 @@ def main():
     server_list = sys.argv[7]
     this_outstanding = 0
     last_outstanding = 0
-    contestant_names = ["E B", "T G", "K C", "J A", "A B", "J E", "A R", "N C", "K W", "E D", "L N", "T M"]
+    contestant_names = "Edwina Burnam,Tabatha Gehling,Kelly Clauss,Jessie Alloway,Alana Bregman,Jessie Eichman,Allie Rogalski,Nita Coster,Kurt Walser,Ericka Dieter,Loraine Nygren,Tania Mattioli"
 
     print "Allowing %d votes per phone number" % max_votes_per_phone_number
     print "Submitting %d SP calls/sec" % transactions_per_sec
@@ -209,7 +209,7 @@ def main():
     else:
         for row in table.tuples:
             result_name = row[0]
-            result_votes = row[1]
+            result_votes = row[2]
             print " - Contestant %s received %d vote(s)" % (result_name, result_votes)
 
             if result_votes > winner_votes:
