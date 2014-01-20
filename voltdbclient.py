@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # This file is part of VoltDB.
-# Copyright (C) 2008-2013 VoltDB Inc.
+# Copyright (C) 2008-2014 VoltDB Inc.
 #
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files (the
@@ -74,7 +74,6 @@ class FastSerializer:
     VOLTTYPE_STRING = 9
     VOLTTYPE_TIMESTAMP = 11 # 8 byte long
     VOLTTYPE_DECIMAL = 22  # fixed precision decimal
-    VOLTTYPE_DECIMAL_STRING = 23  # NOT USED?
     VOLTTYPE_MONEY = 20     # 8 byte long
     VOLTTYPE_VOLTTABLE = 21
     VOLTTYPE_VARBINARY = 25
@@ -100,15 +99,31 @@ class FastSerializer:
     # that host order is little endian. See isNaN().
 
     def __init__(self, host = None, port = 21212, username = "",
-                 password = "", dump_file = None):
+                 password = "", dump_file_path = None,
+                 connect_timeout = 8,
+                 procedure_timeout = None,
+                 default_timeout = None):
+        """
+        :param host: host string for connection or None
+        :param port: port for connection or None
+        :param username: authentication user name for connection or None
+        :param password: authentication password for connection or None
+        :param dump_file_path: path to optional dump file or None
+        :param connect_timeout: timeout (secs) or None for authentication (default=8)
+        :param procedure_timeout: timeout (secs) or None for procedure calls (default=None)
+        :param default_timeout: default timeout (secs) or None for all other operations (default=None)
+        """
         # connect a socket to host, port and get a file object
         self.wbuf = array.array('c')
         self.rbuf = ""
         self.host = host
         self.port = port
-        self.dump_file = None
-        if dump_file != None:
-            self.dump_file = open(dump_file, "wb")
+        if not dump_file_path is None:
+            self.dump_file = open(dump_file_path, "wb")
+        else:
+            self.dump_file = None
+        self.default_timeout = default_timeout
+        self.procedure_timeout = procedure_timeout
 
         self.socket = None
         if self.host != None and self.port != None:
@@ -131,8 +146,7 @@ class FastSerializer:
                        self.VOLTTYPE_STRING: self.readString,
                        self.VOLTTYPE_VARBINARY: self.readVarbinary,
                        self.VOLTTYPE_TIMESTAMP: self.readDate,
-                       self.VOLTTYPE_DECIMAL: self.readDecimal,
-                       self.VOLTTYPE_DECIMAL_STRING: self.readDecimalString}
+                       self.VOLTTYPE_DECIMAL: self.readDecimal}
         self.WRITER = {self.VOLTTYPE_NULL: self.writeNull,
                        self.VOLTTYPE_TINYINT: self.writeByte,
                        self.VOLTTYPE_SMALLINT: self.writeInt16,
@@ -142,8 +156,7 @@ class FastSerializer:
                        self.VOLTTYPE_STRING: self.writeString,
                        self.VOLTTYPE_VARBINARY: self.writeVarbinary,
                        self.VOLTTYPE_TIMESTAMP: self.writeDate,
-                       self.VOLTTYPE_DECIMAL: self.writeDecimal,
-                       self.VOLTTYPE_DECIMAL_STRING: self.writeDecimalString}
+                       self.VOLTTYPE_DECIMAL: self.writeDecimal}
         self.ARRAY_READER = {self.VOLTTYPE_TINYINT: self.readByteArray,
                              self.VOLTTYPE_SMALLINT: self.readInt16Array,
                              self.VOLTTYPE_INTEGER: self.readInt32Array,
@@ -151,8 +164,7 @@ class FastSerializer:
                              self.VOLTTYPE_FLOAT: self.readFloat64Array,
                              self.VOLTTYPE_STRING: self.readStringArray,
                              self.VOLTTYPE_TIMESTAMP: self.readDateArray,
-                             self.VOLTTYPE_DECIMAL: self.readDecimalArray,
-                             self.VOLTTYPE_DECIMAL_STRING: self.readDecimalStringArray}
+                             self.VOLTTYPE_DECIMAL: self.readDecimalArray}
 
         self.__compileStructs()
 
@@ -195,7 +207,12 @@ class FastSerializer:
                                       None, x)}
 
         if username != None and password != None and host != None:
+            assert not self.socket is None
+            self.socket.settimeout(connect_timeout)
             self.authenticate(username, password)
+
+        if self.socket:
+            self.socket.settimeout(self.default_timeout)
 
     def __compileStructs(self):
         # Compiled structs for each type
@@ -241,7 +258,14 @@ class FastSerializer:
         self.flush()
 
         # A length, version number, and status code is returned
-        self.bufferForRead()
+        try:
+            self.bufferForRead()
+        except IOError, e:
+            print "ERROR: Connection failed. Please check that the host and port are correct."
+            raise e
+        except socket.timeout:
+            raise SystemExit("Authentication timed out after %d seconds."
+                                % self.socket.gettimeout())
         version = self.readByte()
         status = self.readByte()
 
@@ -634,27 +658,6 @@ class FastSerializer:
             retval.append(self.readDecimal())
         return tuple(retval)
 
-    def readDecimalString(self):
-        encoded_string = self.readString()
-        if encoded_string == None:
-            return None
-        val = decimal.Decimal(encoded_string)
-        (sign, digits, exponent) = val.as_tuple()
-        if -exponent > self.__class__.DEFAULT_DECIMAL_SCALE:
-            raise ValueError("Scale of this decimal is %d and the max is 12"
-                             % (-exponent))
-        if len(digits) > 38:
-            raise ValueError("Precision of this decimal is %d and the max is 38"
-                             % (len(digits)))
-        return val
-
-    def readDecimalStringArray(self):
-        retval = []
-        cnt = self.readInt16()
-        for i in xrange(cnt):
-            retval.append(self.readDecimalString())
-        return tuple(retval)
-
     def __intToBytes(self, value, sign):
         value_bytes = ""
         if sign == 1:
@@ -1008,10 +1011,23 @@ class VoltProcedure:
         self.fser.prependLength() # prepend the total length of the invocation
         self.fser.flush()
 
+        # The timeout in effect for the procedure call is the timeout argument
+        # if not None or self.procedure_timeout. Exceeding that time will raise
+        # a timeout exception. Restores the original timeout value when done.
+        # This default argument usage does not allow overriding with None.
+        if timeout is None:
+            timeout = self.fser.procedure_timeout
+        original_timeout = self.fser.socket.gettimeout()
+        self.fser.socket.settimeout(timeout)
         try:
-            self.fser.socket.settimeout(timeout) # timeout exception will be raised
-            res = VoltResponse(self.fser)
-        except IOError, err:
-            res = VoltResponse(None)
-            res.statusString = str(err)
+            try:
+                res = VoltResponse(self.fser)
+            except socket.timeout:
+                res = VoltResponse(None)
+                res.statusString = "timeout: procedure call took longer than %d seconds" % timeout
+            except IOError, err:
+                res = VoltResponse(None)
+                res.statusString = str(err)
+        finally:
+            self.fser.socket.settimeout(original_timeout)
         return response and res or None
