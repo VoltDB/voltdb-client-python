@@ -1,0 +1,14 @@
+This test exercises the VoltDB Python client with a large result set. It is
+based on a stripped down version of the Voter example, with the addition of the
+BigResults stored procedure to generate an artificial large result set.
+
+To enable profiling change G.profile to True in test.py.
+
+To use this test:
+
+- Compile the stored procedure and catalog, and start the server using "./run.sh".
+- Run the test using "python test.py".
+- Stop the server using Ctrl-C or by calling the @Shutdown system procedure.
+
+Note that the catalog and store procedure can be separately recompiled using
+"./run.sh catalog".
