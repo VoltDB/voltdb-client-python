@@ -27,11 +27,11 @@ from voltdbclient import *
 client = FastSerializer("localhost", 21212)
 proc = VoltProcedure( client, "Insert", [FastSerializer.VOLTTYPE_STRING, FastSerializer.VOLTTYPE_STRING, FastSerializer.VOLTTYPE_STRING] )
 
-proc.call([ "Hello", "World", "English" ])
-proc.call([ "Bonjour", "Monde", "French" ])
-proc.call([ "Hola", "Mundo", "Spanish" ])
-proc.call([ "Hej", "Verden", "Danish" ])
-proc.call([ "Ciao", "Mondo", "Italian" ])
+proc.call([ "English", "Hello", "World" ])
+proc.call([ "French" , "Bonjour", "Monde" ])
+proc.call([ "Spanish", "Hola", "Mundo" ])
+proc.call([ "Danish", "Hej", "Verden" ])
+proc.call([ "Italian", "Ciao", "Mondo" ])
 
 proc = VoltProcedure( client, "Select", [FastSerializer.VOLTTYPE_STRING])
 response = proc.call( ["Spanish"] )
