@@ -2,7 +2,8 @@ Description
 
 The VoltDB Python client library is a native Python implementation of the VoltDB
 wire protocol. It provides the functionality of connecting to a VoltDB server,
-authenticating the client, and making procedure calls.
+authenticating the client, and making procedure calls.  The client supports
+Python 2.x, with a minimum version of 2.5.
 
 The core of the Python client library is the FastSerializer class. It manages
 the connection to the server and serializes/deserializes the VoltDB primitive
@@ -132,3 +133,9 @@ the server is not secure, so that it does not require authentication.
     >>> print response
 
 The output will be a human-readable form of the VoltResponse object.
+
+Release Notes
+
+Changes in V4
+- Requires minimum version of Python V2.5.
+- Processing of large (10K+) results sets sped up.
