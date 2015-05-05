@@ -30,10 +30,7 @@ import socket
 import struct
 import datetime
 import decimal
-try:
-    from hashlib import sha256 as sha
-except ImportError:
-    from sha import sha
+import hashlib
 
 decimal.getcontext().prec = 38
 
@@ -288,7 +285,7 @@ class FastSerializer:
             self.writeString("")
 
         # password supplied, sha-256 hash it
-        m = sha()
+        m = hashlib.sha256()
         m.update(password)
         pwHash = m.digest()
         self.wbuf.extend(pwHash)
