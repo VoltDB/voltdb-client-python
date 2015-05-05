@@ -31,7 +31,7 @@ import struct
 import datetime
 import decimal
 try:
-    from hashlib import sha1 as sha
+    from hashlib import sha256 as sha
 except ImportError:
     from sha import sha
 
@@ -273,7 +273,9 @@ class FastSerializer:
         # authentication is turned off.
 
         #protocol version
-        self.writeByte(0)
+        self.writeByte(1)
+        #sha256
+        self.writeByte(1)
 
         # service requested
         self.writeString("database")
@@ -285,7 +287,7 @@ class FastSerializer:
             # no username, just output length of 0
             self.writeString("")
 
-        # password supplied, sha-1 hash it
+        # password supplied, sha-256 hash it
         m = sha()
         m.update(password)
         pwHash = m.digest()
