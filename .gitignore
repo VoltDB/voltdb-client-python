@@ -1,0 +1,8 @@
+/dist
+/voltdbclient.egg-info
+
+# Default built files
+*.pyc
+
+# make_kit.sh writes out its version to .kit_version
+.kit_version

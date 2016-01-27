@@ -14,5 +14,5 @@ echo "Making kit $BUILD_TARGET/$DIST_NAME.tar.gz"
 THISDIR=${PWD##*/}
 cd ..
 ln -sf $THISDIR $DIST_NAME
-tar cvzfh $BUILD_TARGET/$DIST_NAME.tar.gz $DIST_NAME   --exclude=.git --exclude=make_kit.sh 
+tar cvzfh $BUILD_TARGET/$DIST_NAME.tar.gz $DIST_NAME   --exclude=.git --exclude=make_kit.sh --exclude=dist --exclude=voltdbclient.egg-info
 rm -f $DIST_NAME
