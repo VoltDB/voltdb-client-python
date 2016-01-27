@@ -5,6 +5,10 @@ wire protocol. It provides the functionality of connecting to a VoltDB server,
 authenticating the client, and making procedure calls.  The client supports
 Python 2.x, with a minimum version of 2.5.
 
+The code is split in two parts. The Python client library itself,
+which can be found in the `voltdbclient` subdirectory, and examples of
+using it, which can be foind in the `examples` subdirectory.
+
 The core of the Python client library is the FastSerializer class. It manages
 the connection to the server and serializes/deserializes the VoltDB primitive
 types. There are higher level classes which wraps around the FastSerializer
