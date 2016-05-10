@@ -23,20 +23,19 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 import sys
-sys.path.append("..")
+sys.path.append("../..")
 from voltdbclient import *
+from datetime import datetime
 
 client = FastSerializer("localhost", 21212)
-proc = VoltProcedure( client, "Insert", [FastSerializer.VOLTTYPE_STRING, FastSerializer.VOLTTYPE_STRING, FastSerializer.VOLTTYPE_STRING] )
+proc_insert = VoltProcedure( client, "HELLO_TYPES.insert", [FastSerializer.VOLTTYPE_INTEGER,FastSerializer.VOLTTYPE_TIMESTAMP] )
+proc_select = VoltProcedure( client, "HELLO_TYPES.select", [FastSerializer.VOLTTYPE_INTEGER])
 
-proc.call([ "English", "Hello", "World" ])
-proc.call([ "French" , "Bonjour", "Monde" ])
-proc.call([ "Spanish", "Hola", "Mundo" ])
-proc.call([ "Danish", "Hej", "Verden" ])
-proc.call([ "Italian", "Ciao", "Mondo" ])
+my_date = datetime(2016, 1, 1, 0, 0, 0, 0)
 
-proc = VoltProcedure( client, "Select", [FastSerializer.VOLTTYPE_STRING])
-response = proc.call( ["Spanish"] )
+proc_insert.call([ 1, my_date ])
+
+response = proc_select.call( [ 1 ] )
 
 for x in response.tables:
     print x

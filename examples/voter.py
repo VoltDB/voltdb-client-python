@@ -26,6 +26,7 @@ import sys
 import time
 import random
 import threading
+sys.path.append("..")
 from voltdbclient import *
 
 # main method of voter client

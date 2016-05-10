@@ -3,9 +3,6 @@ be used with example projects shipped with the main distribution.
 You will need to have a server running with the appropriate catalog
 or ddl loaded for these examples to work.
 
-You will need to copy voltdbclient.py to the examples directory for
-the examples to run.
-
 # Hello World
 
 First, follow the instructions in the VoltDB kit's doc/tutorials/helloworld
