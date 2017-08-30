@@ -60,13 +60,13 @@ FastSerializer(host, port, usessl, username, password, kerberos, dump_file_path,
     and password (string) is given, authenticate the client using them. If
     dump_file (string) is given, all the data received from and sent to the
     server will be written into the file pointed to by dump_file. If kerberos (bool)
-    is True, it use Kerberos to authenticate. If usessl (bool) is True, use ssl.
+    is True, use Kerberos to authenticate. If usessl (bool) is True, use ssl.
     A config file, ssl_config_file (string), can be specified to use Java KeyStore
     (JKS) data for the ssl connection. The connection supports three timeout
     settings: connect_timeout specifies how long to wait (integer)
-    for connection authentication, procedure_timeout (integer) to specify
+    for connection authentication, procedure_timeout (integer) specifies
     how long to wait for procedure calls and default_timeout (integer)
-    how long to wait for all other operations. All timeouts are specified
+    specifies how long to wait for all other operations. All timeouts are specified
     in seconds.
 
 FastSerializer.close()
@@ -149,6 +149,6 @@ Changes in V4
 - Requires minimum version of Python V2.5.
 - Processing of large (10K+) results sets sped up.
 
-Changes in V7.5
+Changes in V7.1
 - Support for SSL
 - Support for Kerberos
