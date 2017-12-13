@@ -32,7 +32,7 @@ from voltdbclient import *
 def main():
     # prints required command line arguments if these were not passed in correctly
     if len(sys.argv) < 8:
-        print "ClientVoter [number of contestants] [votes per phone number] [transactions per second] [client feedback interval (seconds)] [test duration (seconds)] [lag record delay (seconds)] [server list (comma separated)]"
+        print("ClientVoter [number of contestants] [votes per phone number] [transactions per second] [client feedback interval (seconds)] [test duration (seconds)] [lag record delay (seconds)] [server list (comma separated)]")
         exit(1)
 
     # checks for validity of 1st command line argument
@@ -40,7 +40,7 @@ def main():
     global max_contestant
     max_contestant = int(sys.argv[1])
     if max_contestant < 1 or max_contestant > 12:
-        print "Number of contestants must be between 1 and 12"
+        print("Number of contestants must be between 1 and 12")
         exit(1)
 
     # sets up global variables, including:
@@ -74,22 +74,22 @@ def main():
     vote_result_counter = [0, 0, 0]
 
     # assigns values to other variables using command line arguments and creativity
-    max_votes_per_phone_number = long(sys.argv[2])
-    transactions_per_sec = long(sys.argv[3])
+    max_votes_per_phone_number = int(sys.argv[2])
+    transactions_per_sec = int(sys.argv[3])
     transactions_per_milli = transactions_per_sec / float(1000) # uses millis, not secs
-    client_feedback_interval_secs = long(sys.argv[4])
-    test_duration_secs = long(sys.argv[5])
-    lag_latency_secs = long(sys.argv[6])
+    client_feedback_interval_secs = int(sys.argv[4])
+    test_duration_secs = int(sys.argv[5])
+    lag_latency_secs = int(sys.argv[6])
     server_list = sys.argv[7]
     this_outstanding = 0
     last_outstanding = 0
     contestant_names = "Edwina Burnam,Tabatha Gehling,Kelly Clauss,Jessie Alloway,Alana Bregman,Jessie Eichman,Allie Rogalski,Nita Coster,Kurt Walser,Ericka Dieter,Loraine Nygren,Tania Mattioli"
 
-    print "Allowing %d votes per phone number" % max_votes_per_phone_number
-    print "Submitting %d SP calls/sec" % transactions_per_sec
-    print "Feedback interval = %d second(s)" % client_feedback_interval_secs
-    print "Running for %d second(s)" % test_duration_secs
-    print "Latency not recorded for %d second(s)" % lag_latency_secs
+    print(("Allowing %d votes per phone number" % max_votes_per_phone_number))
+    print(("Submitting %d SP calls/sec" % transactions_per_sec))
+    print(("Feedback interval = %d second(s)" % client_feedback_interval_secs))
+    print(("Running for %d second(s)" % test_duration_secs))
+    print(("Latency not recorded for %d second(s)" % lag_latency_secs))
 
     phone_number = None
     contestant_number = None
@@ -174,7 +174,7 @@ def main():
             results_lock.acquire()
             this_outstanding = num_sp_calls - tot_executions
             avg_latency = float(tot_execution_secs) * 1000 / float(tot_executions_latency)
-            print "%f%% Complete | SP Calls: %d at %f SP/sec | outstanding = %d (%d) | min = %d | max = %d | avg = %f" % (percent_complete, num_sp_calls, (float(num_sp_calls) / float(elapsed_time_secs_2)), this_outstanding, (this_outstanding - last_outstanding), (min_execution_secs * 1000), (max_execution_secs * 1000), avg_latency)
+            print(("%f%% Complete | SP Calls: %d at %f SP/sec | outstanding = %d (%d) | min = %d | max = %d | avg = %f" % (percent_complete, num_sp_calls, (float(num_sp_calls) / float(elapsed_time_secs_2)), this_outstanding, (this_outstanding - last_outstanding), (min_execution_secs * 1000), (max_execution_secs * 1000), avg_latency)))
             last_outstanding = this_outstanding
             results_lock.release()
     shouldContinue = False
@@ -186,14 +186,14 @@ def main():
     elapsed_time_secs = time.time() - start_time
 
     # prints statistics about the numbers of accepted/rejected votes
-    print
-    print "****************************************************************************"
-    print "Voting Results"
-    print "****************************************************************************"
-    print " - Accepted votes = %d" % vote_result_counter[0]
-    print " - Rejected votes (invalid contestant) = %d" % vote_result_counter[1]
-    print " - Rejected votes (voter over limit) = %d" % vote_result_counter[2]
-    print
+    print()
+    print("****************************************************************************")
+    print("Voting Results")
+    print("****************************************************************************")
+    print((" - Accepted votes = %d" % vote_result_counter[0]))
+    print((" - Rejected votes (invalid contestant) = %d" % vote_result_counter[1]))
+    print((" - Rejected votes (voter over limit) = %d" % vote_result_counter[2]))
+    print()
 
     winner_name = "<<UNKNOWN>>"
     winner_votes = -1
@@ -205,12 +205,12 @@ def main():
     response = resultsprocedure.call([])
     table = response.tables[0]
     if len(table.tuples) == 0:
-        print " - No results to report."
+        print(" - No results to report.")
     else:
         for row in table.tuples:
             result_name = row[0]
             result_votes = row[2]
-            print " - Contestant %s received %d vote(s)" % (result_name, result_votes)
+            print((" - Contestant %s received %d vote(s)" % (result_name, result_votes)))
 
             if result_votes > winner_votes:
                 winner_votes = result_votes
@@ -218,25 +218,25 @@ def main():
 
     # prints winner data
     # prints statistics about average latency and distribution of stored procedures across ranges in latency
-    print
-    print " - Contestant %s was the winner with %d vote(s)" % (winner_name, winner_votes)
-    print
-    print "****************************************************************************"
-    print "System Statistics"
-    print "****************************************************************************"
-    print " - Ran for %f second(s)" % elapsed_time_secs
-    print " - Performed %d Stored Procedure call(s)" % num_sp_calls
-    print " - At %f call(s) per second" % (num_sp_calls / elapsed_time_secs)
-    print " - Average Latency = %f ms" % (float(tot_execution_secs) * 1000 / float(tot_executions_latency))
-    print " - Latency   0ms -  25ms = %d" % latency_counter[0]
-    print " - Latency  25ms -  50ms = %d" % latency_counter[1]
-    print " - Latency  50ms -  75ms = %d" % latency_counter[2]
-    print " - Latency  75ms - 100ms = %d" % latency_counter[3]
-    print " - Latency 100ms - 125ms = %d" % latency_counter[4]
-    print " - Latency 125ms - 150ms = %d" % latency_counter[5]
-    print " - Latency 150ms - 175ms = %d" % latency_counter[6]
-    print " - Latency 175ms - 200ms = %d" % latency_counter[7]
-    print " - Latency 200ms+        = %d" % latency_counter[8]
+    print()
+    print((" - Contestant %s was the winner with %d vote(s)" % (winner_name, winner_votes)))
+    print()
+    print("****************************************************************************")
+    print("System Statistics")
+    print("****************************************************************************")
+    print((" - Ran for %f second(s)" % elapsed_time_secs))
+    print((" - Performed %d Stored Procedure call(s)" % num_sp_calls))
+    print((" - At %f call(s) per second" % (num_sp_calls / elapsed_time_secs)))
+    print((" - Average Latency = %f ms" % (float(tot_execution_secs) * 1000 / float(tot_executions_latency))))
+    print((" - Latency   0ms -  25ms = %d" % latency_counter[0]))
+    print((" - Latency  25ms -  50ms = %d" % latency_counter[1]))
+    print((" - Latency  50ms -  75ms = %d" % latency_counter[2]))
+    print((" - Latency  75ms - 100ms = %d" % latency_counter[3]))
+    print((" - Latency 100ms - 125ms = %d" % latency_counter[4]))
+    print((" - Latency 125ms - 150ms = %d" % latency_counter[5]))
+    print((" - Latency 150ms - 175ms = %d" % latency_counter[6]))
+    print((" - Latency 175ms - 200ms = %d" % latency_counter[7]))
+    print((" - Latency 200ms+        = %d" % latency_counter[8]))
 
 # class, whose objects run in separate threads
 # responsible for invoking stored procedure 'Vote' and processing results (updating statistics)
@@ -285,7 +285,7 @@ class doQueries(threading.Thread):
             response = self.proc.call( [params[0], params[1], max_contestant] )
             time_after = time.time()
             if response.status != 1:
-                print "Failed to execute!!!"
+                print("Failed to execute!!!")
                 exit(-1)
             else:
                 # updates statistics about execution count, execution times, vote successes/failures, and latency
