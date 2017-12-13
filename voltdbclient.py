@@ -16,8 +16,8 @@
 # along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
 
 import sys
-if sys.hexversion < 0x02050000:
-    raise Exception("Python version 2.5 or greater is required.")
+if sys.version_info < (2,7)
+    raise Exception("Python version 2.7 or greater is required.")
 import array
 import socket
 import base64, textwrap
@@ -48,6 +48,26 @@ except ImportError as e:
 
 decimal.getcontext().prec = 38
 
+def int16toBytes(val):
+    return [val >>  8 & 0xff,
+            val >>  0 & 0xff]
+
+def int32toBytes(val):
+    return [val >> 24 & 0xff,
+            val >> 16 & 0xff,
+            val >>  8 & 0xff,
+            val >>  0 & 0xff]
+
+def int64toBytes(val):
+    return [val >> 56 & 0xff,
+            val >> 48 & 0xff,
+            val >> 40 & 0xff,
+            val >> 32 & 0xff,
+            val >> 24 & 0xff,
+            val >> 16 & 0xff,
+            val >>  8 & 0xff,
+            val >>  0 & 0xff]
+
 def isNaN(d):
     """Since Python has the weird behavior that a float('nan') is not equal to
     itself, we have to test it by ourselves.
@@ -77,7 +97,7 @@ class ReadBuffer(object):
         self.clear()
 
     def clear(self):
-        self._buf = ""
+        self._buf = bytes()
         self._off = 0
 
     def buffer_length(self):
@@ -191,7 +211,7 @@ class FastSerializer:
         :param ssl_config_file: config file that defines java keystore and truststore files
         """
         # connect a socket to host, port and get a file object
-        self.wbuf = array.array('c')
+        self.wbuf = array.array('B')
         self.host = host
         self.port = port
         self.usessl = usessl
@@ -267,36 +287,28 @@ class FastSerializer:
                               lambda x: None,
                           self.VOLTTYPE_TINYINT:
                               lambda x:
-                              if_else(x == self.__class__.NULL_TINYINT_INDICATOR,
-                                      None, x),
+                              if_else(x == self.__class__.NULL_TINYINT_INDICATOR, None, x),
                           self.VOLTTYPE_SMALLINT:
                               lambda x:
-                              if_else(x == self.__class__.NULL_SMALLINT_INDICATOR,
-                                      None, x),
+                              if_else(x == self.__class__.NULL_SMALLINT_INDICATOR, None, x),
                           self.VOLTTYPE_INTEGER:
                               lambda x:
-                              if_else(x == self.__class__.NULL_INTEGER_INDICATOR,
-                                      None, x),
+                              if_else(x == self.__class__.NULL_INTEGER_INDICATOR, None, x),
                           self.VOLTTYPE_BIGINT:
                               lambda x:
-                              if_else(x == self.__class__.NULL_BIGINT_INDICATOR,
-                                      None, x),
+                              if_else(x == self.__class__.NULL_BIGINT_INDICATOR, None, x),
                           self.VOLTTYPE_FLOAT:
                               lambda x:
-                              if_else(abs(x - self.__class__.NULL_FLOAT_INDICATOR) < 1e307,
-                                      None, x),
+                              if_else(abs(x - self.__class__.NULL_FLOAT_INDICATOR) < 1e307, None, x),
                           self.VOLTTYPE_STRING:
                               lambda x:
-                              if_else(x == self.__class__.NULL_STRING_INDICATOR,
-                                      None, x),
+                              if_else(x == self.__class__.NULL_STRING_INDICATOR,  None, x),
                           self.VOLTTYPE_VARBINARY:
                               lambda x:
-                              if_else(x == self.__class__.NULL_STRING_INDICATOR,
-                                      None, x),
+                              if_else(x == self.__class__.NULL_STRING_INDICATOR, None, x),
                           self.VOLTTYPE_DECIMAL:
                               lambda x:
-                              if_else(x == self.NULL_DECIMAL_INDICATOR,
-                                      None, x)}
+                              if_else(x == self.NULL_DECIMAL_INDICATOR, None, x)}
 
         self.read_buffer = ReadBuffer()
 
@@ -431,8 +443,9 @@ class FastSerializer:
 
         # password supplied, sha-256 hash it
         m = hashlib.sha256()
-        m.update(password)
-        pwHash = m.digest()
+        encoded_password = password.encode("utf-8")
+        m.update(encoded_password)
+        pwHash = bytearray(m.digest())
         self.wbuf.extend(pwHash)
 
         self.prependLength()
@@ -538,8 +551,9 @@ class FastSerializer:
         # size of this length preceding value. This value is written
         # in the network order.
         ttllen = self.wbuf.buffer_info()[1] * self.wbuf.itemsize
-        lenBytes = struct.pack(self.inputBOM + 'i', ttllen)
-        list([self.wbuf.insert(0, x) for x in lenBytes[::-1]])
+        lenBytes = int32toBytes(ttllen)
+        #lenBytes = struct.pack(self.inputBOM + 'i', ttllen)
+        [self.wbuf.insert(0, x) for x in lenBytes[::-1]]
 
     def size(self):
         """Returns the size of the write buffer.
@@ -556,7 +570,7 @@ class FastSerializer:
             self.dump_file.write(self.wbuf)
             self.dump_file.write("\n")
         self.socket.sendall(self.wbuf.tostring())
-        self.wbuf = array.array('c')
+        self.wbuf = array.array('B')
 
     def bufferForRead(self):
         if self.socket is None:
@@ -565,7 +579,7 @@ class FastSerializer:
 
         # fully buffer a new length preceded message from socket
         # read the length. the read until the buffer is completed.
-        responseprefix = ""
+        responseprefix = bytes()
         while (len(responseprefix) < 4):
             responseprefix += self.socket.recv(4 - len(responseprefix))
             if responseprefix == "":
@@ -683,7 +697,7 @@ class FastSerializer:
             val = self.__class__.NULL_TINYINT_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.byteType(1), val))
+        self.wbuf.append(val)
 
     # int16
     def readInt16ArrayContent(self, cnt):
@@ -705,7 +719,7 @@ class FastSerializer:
             val = self.__class__.NULL_SMALLINT_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.int16Type(1), val))
+        self.wbuf.extend(int16toBytes(val))
 
     # int32
     def readInt32ArrayContent(self, cnt):
@@ -727,7 +741,7 @@ class FastSerializer:
             val = self.__class__.NULL_INTEGER_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.int32Type(1), val))
+        self.wbuf.extend(int32toBytes(val))
 
     # int64
     def readInt64ArrayContent(self, cnt):
@@ -749,7 +763,7 @@ class FastSerializer:
             val = self.__class__.NULL_BIGINT_INDICATOR
         else:
             val = value
-        self.wbuf.extend(struct.pack(self.int64Type(1), val))
+        self.wbuf.extend(int64toBytes(val))
 
     # float64
     def readFloat64ArrayContent(self, cnt):
@@ -808,8 +822,9 @@ class FastSerializer:
             return
 
         encoded_value = value.encode("utf-8")
+        ba = bytearray(encoded_value)
         self.writeInt32(len(encoded_value))
-        self.wbuf.extend(encoded_value)
+        self.wbuf.extend(ba)
 
     # varbinary
     def readVarbinaryContent(self, cnt):
@@ -894,7 +909,7 @@ class FastSerializer:
         return tuple(retval)
 
     def __intToBytes(self, value, sign):
-        value_bytes = ""
+        value_bytes = bytes()
         if sign == 1:
             value = ~value + 1      # 2's complement
         # Turn into byte array

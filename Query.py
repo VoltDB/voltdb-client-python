@@ -16,6 +16,8 @@
 # along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
 
 import sys
+if sys.version_info < (2,7)
+    raise Exception("Python version 2.7 or greater is required.")
 import cmd
 import socket
 import os.path
@@ -161,10 +163,11 @@ class VoltQueryClient(cmd.Cmd):
 
     def safe_print(self, *var):
         if not self.__quiet:
+            # this uses sys.stdout to deal with python2/3 issues
             for i in var:
                 if i != None:
-                    print(i, end=' ')
-            print()
+                    sys.stdout.write(str(i) + " ")
+            sys.stdout.write("\n")
 
     def set_quiet(self, quiet):
         self.__quiet = quiet
@@ -387,8 +390,7 @@ Get the statistics:
         if(not os.path.isfile(args[0]) or not os.path.isfile(args[1])):
             # args[0] is the catalog jar file
             # args[1] is the deployment xml file
-            print("Either file '%s' doesnot exist OR file '%s' doesnot exist!!" \
-                    (args[0],args[1]), file=sys.stderr)
+            sys.stderr.write("Either file '%s' doesnot exist OR file '%s' doesnot exist!!" % (args[0],args[1]))
             exit(1)
 
         xmlf = open(args[1], "r")
