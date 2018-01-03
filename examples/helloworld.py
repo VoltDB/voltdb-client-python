@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # This file is part of VoltDB.
-# Copyright (C) 2008-2017 VoltDB Inc.
+# Copyright (C) 2008-2018 VoltDB Inc.
 #
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files (the
@@ -37,4 +37,4 @@ proc = VoltProcedure( client, "Select", [FastSerializer.VOLTTYPE_STRING])
 response = proc.call( ["Spanish"] )
 
 for x in response.tables:
-    print x
+    print(x)
