@@ -50,6 +50,15 @@ except ImportError as e:
 
 decimal.getcontext().prec = 38
 
+def arraytoBytes(arr):
+    """ array.tostring() deprecated since version 3.2,
+    will be removed in version 3.9.
+    """
+    if sys.version_info < (3,2):
+        return arr.tostring()
+    else:
+        return arr.tobytes()
+
 def int16toBytes(val):
     return [val >>  8 & 0xff,
             val >>  0 & 0xff]
@@ -80,9 +89,9 @@ def isNaN(d):
 
     # work-around for Python 2.4
     s = array.array("d", [d])
-    return (s.tostring() == "\x00\x00\x00\x00\x00\x00\xf8\x7f" or
-            s.tostring() == "\x00\x00\x00\x00\x00\x00\xf8\xff" or
-            s.tostring() == "\x00\x00\x00\x00\x00\x00\xf0\x7f")
+    return (arraytoBytes(s) == "\x00\x00\x00\x00\x00\x00\xf8\x7f" or
+            arraytoBytes(s) == "\x00\x00\x00\x00\x00\x00\xf8\xff" or
+            arraytoBytes(s) == "\x00\x00\x00\x00\x00\x00\xf0\x7f")
 
 def if_else(cond, a, b):
     """Work around Python 2.4
@@ -499,7 +508,7 @@ class FastSerializer:
                     if version != self.AUTH_HANDSHAKE_VERSION or status != self.AUTH_HANDSHAKE:
                         raise RuntimeError("Authentication failed.")
 
-                    in_token = self.readVarbinaryContent(self.read_buffer.remaining()).tostring()
+                    in_token = arraytoBytes(self.readVarbinaryContent(self.read_buffer.remaining()))
                     out_token = ctx.step(in_token)
 
                 try:
@@ -577,7 +586,7 @@ class FastSerializer:
         if self.dump_file != None:
             self.dump_file.write(self.wbuf)
             self.dump_file.write("\n")
-        self.socket.sendall(self.wbuf.tostring())
+        self.socket.sendall(arraytoBytes(self.wbuf))
         self.wbuf = array.array('B')
 
     def bufferForRead(self):
