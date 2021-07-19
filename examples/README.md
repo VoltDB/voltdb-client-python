@@ -6,6 +6,11 @@ or ddl loaded for these examples to work.
 You will need to copy voltdbclient.py to the examples directory for
 the examples to run.
 
+The examples require that the command 'python3' points to Python
+3.6 or later. We use 'python3' rather than the bare 'python'
+command to ensure we use the appropriate version. The VoltDB
+client library no longer supports Python version 2.
+
 # Hello World
 
 First, follow the instructions in the VoltDB kit's doc/tutorials/helloworld
