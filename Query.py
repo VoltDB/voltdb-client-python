@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # This file is part of VoltDB.
-# Copyright (C) 2008-2018 VoltDB Inc.
+# Copyright (C) 2008-2021 VoltDB Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -16,8 +16,9 @@
 # along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
 
 import sys
-if sys.version_info < (2,7):
-    raise Exception("Python version 2.7 or greater is required.")
+if sys.hexversion < 0x03060000:
+    raise Exception("Python version 3.6 or greater is required.")
+
 import cmd
 import socket
 import os.path
@@ -55,7 +56,7 @@ class VoltQueryClient(cmd.Cmd):
                     FastSerializer.VOLTTYPE_TIMESTAMP:
                         lambda x: datetime.fromtimestamp(x)}
 
-    def __init__(self, host, port, username = "", password = "", dump_file = None, client_ssl=False, ssl_config_file=""):
+    def __init__(self, host, port, username = "", password = "", dump_file = None, client_ssl=False, ssl_config_file="", kerberos=False):
         cmd.Cmd.__init__(self)
 
         self.__quiet = False
@@ -63,11 +64,11 @@ class VoltQueryClient(cmd.Cmd):
         # self.__usessl = ssl
         # self.__ssl_config_file = ssl_config_file
 
-        self.__initialize(host, port, username, password, client_ssl, ssl_config_file, dump_file)
+        self.__initialize(host, port, username, password, client_ssl, ssl_config_file, dump_file, kerberos=kerberos)
 
-    def __initialize(self, host, port, username, password, client_ssl, ssl_config_file, dump_file):
+    def __initialize(self, host, port, username, password, client_ssl, ssl_config_file, dump_file, kerberos=False):
         # if supportSSL:
-        self.fs = FastSerializer(host=host, port=port, username=username, password=password, ssl_config_file=ssl_config_file, dump_file_path=dump_file)
+        self.fs = FastSerializer(host=host, port=port, username=username, password=password, ssl_config_file=ssl_config_file, dump_file_path=dump_file, kerberos=kerberos)
         # else:
         #     self.fs = FastSerializer(host=host, port=port, username=username, password=password, dump_file_path=dump_file)
 
@@ -92,7 +93,6 @@ class VoltQueryClient(cmd.Cmd):
         self.snapshotrestore = VoltProcedure(self.fs, "@SnapshotRestore",
                                              [FastSerializer.VOLTTYPE_STRING,
                                               FastSerializer.VOLTTYPE_STRING])
-        self.snapshotstatus = VoltProcedure(self.fs, "@SnapshotStatus")
 
         self.systemcatalog = VoltProcedure(self.fs, "@SystemCatalog",
                                                [FastSerializer.VOLTTYPE_STRING])
@@ -113,6 +113,8 @@ class VoltQueryClient(cmd.Cmd):
         self.shutdown = VoltProcedure(self.fs, "@Shutdown")
 
         self.promote = VoltProcedure(self.fs, "@Promote")
+
+        self.ping = VoltProcedure(self.fs, "@Ping")
 
         self.response = None
 
@@ -145,7 +147,7 @@ class VoltQueryClient(cmd.Cmd):
     def precmd(self, command):
         if self.fs == None:
             self.safe_print("Not connected to any server, please connect first")
-        return command.decode("utf-8")
+        return command
 
     def prepare_params(self, procedure, command):
         params = []
@@ -155,7 +157,7 @@ class VoltQueryClient(cmd.Cmd):
             raise SyntaxError("Expecting %d parameters, %d given" %
                               (len(procedure.paramtypes), len(parsed)))
 
-        for i in range(len(parsed)):
+        for i in xrange(len(parsed)):
             transformer = self.__class__.TRANSFORMERS[procedure.paramtypes[i]]
             params.append(transformer(parsed[i]))
 
@@ -163,11 +165,10 @@ class VoltQueryClient(cmd.Cmd):
 
     def safe_print(self, *var):
         if not self.__quiet:
-            # this uses sys.stdout to deal with python2/3 issues
             for i in var:
                 if i != None:
-                    sys.stdout.write(str(i) + " ")
-            sys.stdout.write("\n")
+                    print(i, end=' ')
+            print()
 
     def set_quiet(self, quiet):
         self.__quiet = quiet
@@ -318,19 +319,6 @@ Get the statistics:
         self.safe_print("Restore a snapshot:")
         self.safe_print("\tsnapshotrestore directory nonce")
 
-    def do_snapshotstatus(self, command):
-        if self.fs == None:
-            return
-
-        self.safe_print("Getting snapshot status")
-        self.response = self.__safe_call(self.snapshotstatus,
-                                         timeout = self.__timeout)
-        self.safe_print(self.response)
-
-    def help_snapshotstatus(self):
-        self.safe_print("Get snapshot status")
-        self.safe_print("\tsnapshotstatus")
-
     def do_syscatalog(self, command):
         if self.fs == None:
             return
@@ -387,19 +375,19 @@ Get the statistics:
         if len(args) != 2:
             return self.help_updatecatalog()
 
-        if(not os.path.isfile(args[0]) or not os.path.isfile(args[1])):
+        if not os.path.isfile(args[0]) or not os.path.isfile(args[1]):
             # args[0] is the catalog jar file
             # args[1] is the deployment xml file
-            sys.stderr.write("Either file '%s' doesnot exist OR file '%s' doesnot exist!!" % (args[0],args[1]))
+            print("Either file '%s' does not exist or file '%s' does not exist." % (args[0],args[1]), file=sys.stderr);
             exit(1)
 
         xmlf = open(args[1], "r")
         xmlcntnts = xmlf.read()
-#       print "xmlcntnts = #%s#" % xmlcntnts
+#       print("xmlcntnts = #%s#" % xmlcntnts)
         jarf = open(args[0], "r")
         jarcntnts = jarf.read()
         hexJarcntnts = jarcntnts.encode('hex_codec')
-#       print "hexJarcntnts = #%s#" % hexJarcntnts
+#       print("hexJarcntnts = #%s#" % hexJarcntnts)
 
         self.safe_print("Updating the application catalog")
         self.response = self.__safe_call(self.updatecatalog,
@@ -491,7 +479,7 @@ Get the statistics:
                     try:
                         self.response = self.__safe_call(self.%s, self.prepare_params(self.%s, command), timeout = self.__timeout)
                         self.safe_print(self.response)
-                    except SyntaxError, strerr:
+                    except SyntaxError as strerr:
                         self.safe_print(strerr)
                    """ % (method_name, parsed[0], proc_name, proc_name)
             tmp = {}
@@ -511,7 +499,13 @@ Get the statistics:
         self.safe_print("\tdefine stored_procedure_name param_type_1",
                         "param_type_2...")
         self.safe_print()
-        self.safe_print("Supported types", list(self.__class__.TYPES.keys()))
+        self.safe_print("Supported types", self.__class__.TYPES.keys())
+
+    def do_ping(self, command):
+        if self.fs == None:
+            return
+        self.response = self.__safe_call(self.ping, timeout = self.__timeout)
+        self.safe_print(self.response)
 
 def help(program_name):
     print(program_name, "hostname port [dump=filename] [command]")
@@ -528,9 +522,9 @@ if __name__ == "__main__":
         del sys.argv[3]
 
     try:
-        command = VoltQueryClient(sys.argv[1], int(sys.argv[2]))
-        # command = VoltQueryClient(sys.argv[1], int(sys.argv[2]),
-        #                           dump_file = filename, usessl=True, ssl_config_file="/home/pshaw/keystore.props")
+        command = VoltQueryClient(sys.argv[1], int(sys.argv[2]), dump_file=filename)
+        # command = VoltQueryClient(sys.argv[1], int(sys.argv[2]), dump_file = filename,
+        #                           usessl=True, ssl_config_file="/home/pshaw/keystore.props")
     except socket.error:
         sys.stderr.write("Error connecting to the server %s\n" % (sys.argv[1]))
         exit(-1)

@@ -35,4 +35,4 @@ For further reading:
 
 * [VoltDB Wiki](https://github.com/VoltDB/voltdb/wiki) on Github
 * [VoltDB Public](http://chat.voltdb.com/) on Slack
-* [VoltDB Community Forum](https://forum.voltdb.com/)
+* [VoltDB on Stack Overflow](https://stackoverflow.com/questions/tagged/voltdb)

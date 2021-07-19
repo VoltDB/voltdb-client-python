@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (C) 2008-2021 VoltDB Inc.
+# This file is part of the voltdb/voltdb-client-python repository.
+
 if [ $# -ne 1 ]
 then
     echo "Usage: `basename $0` version-string"
@@ -14,5 +17,5 @@ echo "Making kit $BUILD_TARGET/$DIST_NAME.tar.gz"
 THISDIR=${PWD##*/}
 cd ..
 ln -sf $THISDIR $DIST_NAME
-tar cvzfh $BUILD_TARGET/$DIST_NAME.tar.gz $DIST_NAME   --exclude=.git --exclude=make_kit.sh 
+tar cvzfh $BUILD_TARGET/$DIST_NAME.tar.gz $DIST_NAME   --exclude=.git --exclude=make_kit.sh
 rm -f $DIST_NAME

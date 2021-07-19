@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # This file is part of VoltDB.
-# Copyright (C) 2008-2018 VoltDB Inc.
+# Copyright (C) 2008-2021 VoltDB Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -16,8 +16,8 @@
 # along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
 
 import sys
-if sys.version_info < (2,7):
-    raise Exception("Python version 2.7 or greater is required.")
+if sys.hexversion < 0x03060000:
+    raise Exception("Python version 3.6 or greater is required.")
 import array
 import socket
 import base64, textwrap
@@ -28,6 +28,8 @@ import hashlib
 import re
 import math
 import os
+import stat
+
 try:
     import ssl
     ssl_available = True
@@ -47,6 +49,18 @@ except ImportError as e:
     pyjks_available = False
     pyjks_exception = e
 
+logger = None
+
+def use_logging():
+    import logging
+    global logger
+    logger = logging.getLogger()
+
+def error(text):
+    if logger:
+        logger.error(text)
+    else:
+        print(text)
 
 decimal.getcontext().prec = 38
 
@@ -71,25 +85,12 @@ def int64toBytes(val):
             val >>  0 & 0xff]
 
 def isNaN(d):
-    """Since Python has the weird behavior that a float('nan') is not equal to
-    itself, we have to test it by ourselves.
-    """
-
+    # Per IEEE 754, 'NaN == NaN' must be false,
+    # so we cannot check for simple equality
     if d == None:
         return False
-
-    # work-around for Python 2.4
-    s = array.array("d", [d])
-    return (s.tostring() == "\x00\x00\x00\x00\x00\x00\xf8\x7f" or
-            s.tostring() == "\x00\x00\x00\x00\x00\x00\xf8\xff" or
-            s.tostring() == "\x00\x00\x00\x00\x00\x00\xf0\x7f")
-
-def if_else(cond, a, b):
-    """Work around Python 2.4
-    """
-
-    if cond: return a
-    else: return b
+    else: # routine misnamed, returns true for 'Inf' too
+        return math.isnan(d) or math.isinf(d)
 
 class ReadBuffer(object):
     """
@@ -124,7 +125,7 @@ class ReadBuffer(object):
         try:
             values = struct.unpack_from(format, self._buf, self._off)
         except struct.error as e:
-            print(('Exception unpacking %d bytes using format "%s": %s' % (size, format, str(e))))
+            error('Exception unpacking %d bytes using format "%s": %s' % (size, format, str(e)))
             raise e
         self.shift(size)
         return values
@@ -233,18 +234,26 @@ class FastSerializer:
 
         self.socket = None
         if self.host != None and self.port != None:
-            ss = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            if (self.usessl):
-                if (ssl_available):
+            ai = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP, socket.AI_ADDRCONFIG)[0]
+            # ai = (family, socktype, proto, canonname, sockaddr)
+            ss = socket.socket(ai[0], ai[1], ai[2])
+            if self.usessl:
+                if ssl_available:
                     self.socket = self.__wrap_socket(ss)
                 else:
-                    print("ERROR: To use SSL functionality please Install the Python ssl module.")
+                    error("ERROR: To use SSL functionality please install the Python ssl module.")
                     raise ssl_exception
             else:
                 self.socket = ss
             self.socket.setblocking(1)
             self.socket.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-            self.socket.connect((self.host, self.port))
+            try:
+                self.socket.connect(ai[4])
+            except Exception:
+                error("ERROR: Failed to connect to %s port %s" % (ai[4][0], ai[4][1]))
+                raise
+            #if self.usessl:
+            #    print 'Cipher suite: ' + str(self.socket.cipher())
 
         # input can be big or little endian
         self.inputBOM = self.BIG_ENDIAN  # byte order if input stream
@@ -294,29 +303,21 @@ class FastSerializer:
         self.NullCheck = {self.VOLTTYPE_NULL:
                               lambda x: None,
                           self.VOLTTYPE_TINYINT:
-                              lambda x:
-                              if_else(x == self.__class__.NULL_TINYINT_INDICATOR, None, x),
+                              lambda x: None if x == self.__class__.NULL_TINYINT_INDICATOR else x,
                           self.VOLTTYPE_SMALLINT:
-                              lambda x:
-                              if_else(x == self.__class__.NULL_SMALLINT_INDICATOR, None, x),
+                              lambda x: None if x == self.__class__.NULL_SMALLINT_INDICATOR else x,
                           self.VOLTTYPE_INTEGER:
-                              lambda x:
-                              if_else(x == self.__class__.NULL_INTEGER_INDICATOR, None, x),
+                              lambda x: None if x == self.__class__.NULL_INTEGER_INDICATOR else x,
                           self.VOLTTYPE_BIGINT:
-                              lambda x:
-                              if_else(x == self.__class__.NULL_BIGINT_INDICATOR, None, x),
+                              lambda x: None if x == self.__class__.NULL_BIGINT_INDICATOR else x,
                           self.VOLTTYPE_FLOAT:
-                              lambda x:
-                              if_else(abs(x - self.__class__.NULL_FLOAT_INDICATOR) < 1e307, None, x),
+                              lambda x: None if abs(x - self.__class__.NULL_FLOAT_INDICATOR) < 1e307 else x,
                           self.VOLTTYPE_STRING:
-                              lambda x:
-                              if_else(x == self.__class__.NULL_STRING_INDICATOR,  None, x),
+                              lambda x: None if x == self.__class__.NULL_STRING_INDICATOR else x,
                           self.VOLTTYPE_VARBINARY:
-                              lambda x:
-                              if_else(x == self.__class__.NULL_STRING_INDICATOR, None, x),
+                              lambda x: None if x == self.__class__.NULL_STRING_INDICATOR else x,
                           self.VOLTTYPE_DECIMAL:
-                              lambda x:
-                              if_else(x == self.NULL_DECIMAL_INDICATOR, None, x)}
+                              lambda x: None if x == self.NULL_DECIMAL_INDICATOR else x}
 
         self.read_buffer = ReadBuffer()
 
@@ -336,14 +337,61 @@ class FastSerializer:
         if self.socket:
             self.socket.settimeout(self.default_timeout)
 
+    # Front end to SSL socket support.
+    #
+    # The SSL config file contains a sequence of key=value lines which
+    # are used to provide the arguments to the SSL wrap_socket call:
+    #   Key                Value                    Provides arguments
+    #   ------------------ ------------------------ ------------------
+    #   keystore           path to JKS keystore     keyfile, certfile
+    #   keystorepassword   password for keystore    --
+    #   truststore         path to JKS truststore   ca_certs, cert_reqs
+    #   truststorepassword password for truststore  --
+    #   cacerts            path to PEM cert chain   ca_certs, cert_reqs
+    #   ssl_version        ignored                  --
+    #
+    # Thus keystore identifies the client (rarely needed), whereas truststore
+    # and cacerts identify the server. If truststore and cacerts are both
+    # specified, cacerts takes precedence.
+    #
+    # An empty or missing ssl_config_file results in no certificate checks.
+
     def __wrap_socket(self, ss):
+        parsed_config = {}
         jks_config = {}
         if self.ssl_config_file:
             with open(os.path.expandvars(os.path.expanduser(self.ssl_config_file)), 'r') as f:
-                lines = f.readlines()
-                for line in lines:
-                    k, v = line.strip().split('=')
-                    jks_config[k.lower()] = v
+                for line in f:
+                    try:
+                        l = line.strip()
+                        if l:
+                            k, v = l.split('=', 1)
+                            parsed_config[k.lower()] = v
+                    except:
+                        raise ValueError('Malformed line in SSL config: ' + line)
+
+        if ('keystore' in parsed_config and parsed_config['keystore']) or \
+           ('truststore' in parsed_config and parsed_config['truststore']):
+            self.__convert_jks_files(ss, parsed_config)
+
+        if 'cacerts' in parsed_config and parsed_config['cacerts']:
+            self.ssl_config['ca_certs'] = parsed_config['cacerts']
+            self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
+
+        protocol = ssl.PROTOCOL_TLS
+
+        return ssl.wrap_socket(ss,
+                               keyfile=self.ssl_config['keyfile'],
+                               certfile=self.ssl_config['certfile'],
+                               server_side=False,
+                               cert_reqs=self.ssl_config['cert_reqs'],
+                               ssl_version=protocol,
+                               ca_certs=self.ssl_config['ca_certs'])
+
+    def __convert_jks_files(self, ss, jks_config):
+        if not pyjks_available:
+            error("To use Java KeyStore please install the 'pyjks' module")
+            raise pyjks_exception
 
         def write_pem(der_bytes, type, f):
             f.write("-----BEGIN %s-----\n" % type)
@@ -351,15 +399,12 @@ class FastSerializer:
             f.write("\n-----END %s-----\n" % type)
 
         # extract key and certs
-        if not pyjks_available:
-            print("To use Java KeyStore please install the pyjks")
-            raise pyjks_exception
         use_key_cert = False
         if 'keystore' in jks_config and jks_config['keystore'] and \
-                'keystorepassword' in jks_config and jks_config['keystorepassword']:
+               'keystorepassword' in jks_config and jks_config['keystorepassword']:
             ks = jks.KeyStore.load(jks_config['keystore'], jks_config['keystorepassword'])
-            keyfile = open(jks_config['keystore'] + '.key.pem', 'w')
-            certfile = open(jks_config['keystore'] + '.cert.pem', 'w')
+            keyfile = self.__create(jks_config['keystore'] + '.key.pem')
+            certfile = self.__create(jks_config['keystore'] + '.cert.pem')
             for alias, pk in list(ks.private_keys.items()):
                 # print("Private key: %s" % pk.alias)
                 if pk.algorithm_oid == jks.util.RSA_ENCRYPTION_OID:
@@ -379,9 +424,9 @@ class FastSerializer:
         # extract ca certs
         use_ca_cert = False
         if 'truststore' in jks_config and jks_config['truststore'] and \
-                        'truststorepassword' in jks_config and jks_config['truststorepassword']:
+               'truststorepassword' in jks_config and jks_config['truststorepassword']:
             ts = jks.KeyStore.load(jks_config['truststore'], jks_config['truststorepassword'])
-            cafile = open(jks_config['truststore'] + '.ca.cert.pem', 'w')
+            cafile = self.__create(jks_config['truststore'] + '.ca.cert.pem')
             for alias, c in list(ts.certs.items()):
                 # print("Certificate: %s" % c.alias)
                 write_pem(c.cert, "CERTIFICATE", cafile)
@@ -390,25 +435,11 @@ class FastSerializer:
             if use_ca_cert:
                 self.ssl_config['ca_certs'] = cafile.name
                 self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
-        elif 'cacerts' in jks_config and jks_config['cacerts']:
-            self.ssl_config['ca_certs'] = jks_config['cacerts']
-            self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
 
-        # extract ssl_version
-        if 'ssl_version' in jks_config and jks_config['ssl_version']:
-            self.ssl_config['ca_certs'] = jks_config['ssl_version']
-        tlsv = None
-        try:
-            tlsv = ssl.PROTOCOL_TLSv1_2
-        except AttributeError as e:
-            print("WARNING: This version of python does not support TLSv1.2, upgrade to one that does")
-            tlsv = ssl.PROTOCOL_TLSv1
-
-        return ssl.wrap_socket(ss, self.ssl_config['keyfile'],
-                               self.ssl_config['certfile'], False,
-                               cert_reqs=self.ssl_config['cert_reqs'],
-                               ssl_version=tlsv,
-                               ca_certs=self.ssl_config['ca_certs'])
+    def __create(self, filename):
+        f = open(filename, 'w')
+        os.chmod(filename, stat.S_IRUSR|stat.S_IWUSR)
+        return f
 
     def __compileStructs(self):
         # Compiled structs for each type
@@ -463,7 +494,7 @@ class FastSerializer:
         try:
             self.bufferForRead()
         except IOError as e:
-            print("ERROR: Connection failed. Please check that the host, port and ssl settings are correct.")
+            error("ERROR: Connection failed. Please check that the host, port, and ssl settings are correct.")
             raise e
         except socket.timeout:
             raise RuntimeError("Authentication timed out after %d seconds."
@@ -489,7 +520,7 @@ class FastSerializer:
                     try:
                         self.bufferForRead()
                     except IOError as e:
-                        print("ERROR: Connection failed. Please check that the host, port and ssl settings are correct.")
+                        error("ERROR: Connection failed. Please check that the host, port, and ssl settings are correct.")
                         raise e
                     except socket.timeout:
                         raise RuntimeError("Authentication timed out after %d seconds."
@@ -499,13 +530,13 @@ class FastSerializer:
                     if version != self.AUTH_HANDSHAKE_VERSION or status != self.AUTH_HANDSHAKE:
                         raise RuntimeError("Authentication failed.")
 
-                    in_token = self.readVarbinaryContent(self.read_buffer.remaining()).tostring()
+                    in_token = self.readVarbinaryContent(self.read_buffer.remaining()).tobytes()
                     out_token = ctx.step(in_token)
 
                 try:
                     self.bufferForRead()
                 except IOError as e:
-                    print("ERROR: Connection failed. Please check that the host, port and ssl settings are correct.")
+                    error("ERROR: Connection failed. Please check that the host, port, and ssl settings are correct.")
                     raise e
                 except socket.timeout:
                     raise RuntimeError("Authentication timed out after %d seconds."
@@ -539,9 +570,9 @@ class FastSerializer:
                 self.kerberosprinciple = str(default_cred.name)
                 retval = True
             else:
-                print("ERROR: Kerberos principal found but login expired.")
+                error("ERROR: Kerberos principal found but login expired.")
         except gssapi.raw.misc.GSSError as e:
-            print("ERROR: unable to find default principal from Kerberos cache.")
+            error("ERROR: unable to find default principal from Kerberos cache.")
         return retval
 
     def setInputByteOrder(self, bom):
@@ -571,18 +602,18 @@ class FastSerializer:
 
     def flush(self):
         if self.socket is None:
-            print("ERROR: not connected to server.")
+            error("ERROR: not connected to server.")
             exit(-1)
 
         if self.dump_file != None:
             self.dump_file.write(self.wbuf)
-            self.dump_file.write("\n")
-        self.socket.sendall(self.wbuf.tostring())
+            self.dump_file.write(b"\n")
+        self.socket.sendall(self.wbuf.tobytes())
         self.wbuf = array.array('B')
 
     def bufferForRead(self):
         if self.socket is None:
-            print("ERROR: not connected to server.")
+            error("ERROR: not connected to server.")
             exit(-1)
 
         # fully buffer a new length preceded message from socket
@@ -590,7 +621,7 @@ class FastSerializer:
         responseprefix = bytes()
         while (len(responseprefix) < 4):
             responseprefix += self.socket.recv(4 - len(responseprefix))
-            if responseprefix == "":
+            if responseprefix == b'':
                 raise IOError("Connection broken")
         if self.dump_file != None:
             self.dump_file.write(responseprefix)
@@ -603,18 +634,18 @@ class FastSerializer:
             remaining = responseLength - self.read_buffer.buffer_length()
         if not self.dump_file is None:
             self.dump_file.write(self.read_buffer.get_buffer())
-            self.dump_file.write("\n")
+            self.dump_file.write(b"\n")
 
     def read(self, type):
         if type not in self.READER:
-            print("ERROR: can't read wire type(%d) yet." % (type))
+            error("ERROR: can't read wire type(%d) yet." % (type))
             exit(-2)
 
         return self.READER[type]()
 
     def write(self, type, value):
         if type not in self.WRITER:
-            print("ERROR: can't write wire type(%d) yet." % (type))
+            error("ERROR: can't write wire type(%d) yet." % (type))
             exit(-2)
 
         return self.WRITER[type](value)
@@ -625,7 +656,7 @@ class FastSerializer:
 
     def writeWireType(self, type, value):
         if type not in self.WRITER:
-            print("ERROR: can't write wire type(%d) yet." % (type))
+            error("ERROR: can't write wire type(%d) yet." % (type))
             exit(-2)
 
         self.writeByte(type)
@@ -645,7 +676,7 @@ class FastSerializer:
 
     def readArray(self, type):
         if type not in self.ARRAY_READER:
-            print("ERROR: can't read wire type(%d) yet." % (type))
+            error("ERROR: can't read wire type(%d) yet." % (type))
             exit(-2)
 
         return self.ARRAY_READER[type]()
@@ -661,7 +692,7 @@ class FastSerializer:
             return
 
         if type not in self.ARRAY_READER:
-            print("ERROR: Unsupported date type (%d)." % (type))
+            error("ERROR: Unsupported date type (%d)." % (type))
             exit(-2)
 
         # serialize arrays of bytes as larger values to support
@@ -676,7 +707,7 @@ class FastSerializer:
 
     def writeWireTypeArray(self, type, array):
         if type not in self.ARRAY_READER:
-            print("ERROR: can't write wire type(%d) yet." % (type))
+            error("ERROR: can't write wire type(%d) yet." % (type))
             exit(-2)
 
         self.writeByte(type)
@@ -796,9 +827,8 @@ class FastSerializer:
         if value == None:
             val = self.__class__.NULL_FLOAT_INDICATOR
         else:
-            val = value
-        val = float(value)
-        ba = bytearray(struct.pack(self.float64Type(1), value))
+            val = float(value)
+        ba = bytearray(struct.pack(self.float64Type(1), val))
         self.wbuf.extend(ba)
 
     # string
@@ -839,12 +869,12 @@ class FastSerializer:
     # varbinary
     def readVarbinaryContent(self, cnt):
         if cnt == 0:
-            return array.array('c', [])
+            return array.array('B', [])
 
         offset = cnt * struct.calcsize('c')
         val = self.read_buffer.unpack(self.varbinaryType(cnt), offset)
 
-        return array.array('c', val[0])
+        return array.array('B', val[0])
 
     def readVarbinary(self):
         # length preceeded (4 byte value) string
@@ -1356,7 +1386,7 @@ class VoltTable:
         result += ", ".join([str(x) for x in self.columns])
         result += "\n"
         result += "rows -\n"
-        result += "\n".join([str([if_else(y == None, "NULL", y) for y in x]) for x in self.tuples])
+        result += "\n".join([str(["NULL" if y is None else y for y in x]) for x in self.tuples])
 
         return result
 
@@ -1499,7 +1529,7 @@ class VoltException:
         else:
             for i in range(0, self.length - 3 - 2 - self.message_len):
                 fser.readByte()
-            print("Python client deserialized unknown VoltException.")
+            error("Python client deserialized unknown VoltException.")
 
     def __str__(self):
         msgstr = "VoltException: type: %s\n" % self.typestr
