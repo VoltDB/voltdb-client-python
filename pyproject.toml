@@ -10,8 +10,11 @@ authors = [
 ]
 description = "VoltDB python client"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
+
+[tool.hatch.publish.index]
+disable = true
