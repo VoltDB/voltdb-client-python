@@ -20,7 +20,8 @@ if sys.hexversion < 0x03060000:
     raise Exception("Python version 3.6 or greater is required.")
 import array
 import socket
-import base64, textwrap
+import base64
+import textwrap
 import struct
 import datetime
 import decimal
@@ -1011,11 +1012,11 @@ class FastSerializer:
 
     def readGeographyPoint(self):
         # returns a tuple of a pair of doubles representing lat,long
-        lng = self.readFloat64()
+        lon = self.readFloat64()
         lat = self.readFloat64()
         if (lat == Geography.NULL_COORD) and (lon == Geography.NULL_COORD):
             return None
-        return (lng, lat)
+        return (lon, lat)
 
     def readGeographyPointArray(self):
         retval = []
@@ -1029,7 +1030,7 @@ class FastSerializer:
             self.writeFloat64(Geography.NULL_COORD)
             self.writeFloat64(Geography.NULL_COORD)
             return
-        if not isinstance(num, tuple):
+        if not isinstance(self.num, tuple):
             raise TypeError("point must be a 2-tuple of floats")
         if len(tuple) != 2:
             raise TypeError("point must be a 2-tuple of floats")
@@ -1048,7 +1049,7 @@ class FastSerializer:
 
     def writeGeography(self, geo):
         if geo is None:
-            writeInt32(NULL_STRING_INDICATOR)
+            self.writeInt32(self.NULL_STRING_INDICATOR)
         else:
             geo.flatten(self)
 
@@ -1146,14 +1147,14 @@ class Geography(object):
     VERTEX_SIZE_IN_BYTES = 24
 
     def serializedSize(self):
-        length = POLYGON_OVERHEAD_IN_BYTES
+        length = self.POLYGON_OVERHEAD_IN_BYTES
         for loop in self.loops:
-            length += loopSerializedSize(loop);
+            length += self.loopSerializedSize(loop);
         return length
 
     @staticmethod
     def loopSerializedSize(loop):
-        LOOP_OVERHEAD_IN_BYTES + (len(loop) * VERTEX_SIZE_IN_BYTES)
+        loop.LOOP_OVERHEAD_IN_BYTES + (len(loop) * loop.VERTEX_SIZE_IN_BYTES)
 
     @staticmethod
     def unflatten(fs):
