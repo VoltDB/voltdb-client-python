@@ -1,5 +1,7 @@
 pipeline {
-    agent any
+   agent {
+      label 'gcloud-build--rocky-linux-8--x64'
+    }
     stages {
         stage('Build') {
             steps {
