@@ -1,0 +1,20 @@
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                sh 'python -m build --verbose'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'python -m unittest tests'
+            }
+        }
+        stage('Deploy') {
+            steps {
+                sh 'echo Nothing'
+            }
+        }
+    }
+}
