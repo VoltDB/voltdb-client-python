@@ -20,6 +20,7 @@ __pycache__/
 /backend/dist/
 /dist/
 /site/
+/venv/
 
 # Root files
 /.coverage*
