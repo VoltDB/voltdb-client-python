@@ -5,12 +5,12 @@ pipeline {
     stages {
         stage('Build') {
             steps {
-                sh 'python --version;python get-pip.py; python -m pip install twine; python -m build --verbose'
+                sh 'python3 --version;python3 -m pip install twine; python3 -m build --verbose'
             }
         }
         stage('Test') {
             steps {
-                sh 'python -m unittest tests'
+                sh 'python3 -m unittest tests'
             }
         }
         stage('Deploy') {
