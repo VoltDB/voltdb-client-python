@@ -3,7 +3,7 @@ pipeline {
     stages {
         stage('Build') {
             steps {
-                sh 'python -m pip install twine; python -m build --verbose'
+                sh 'python -m ensurepip --upgrade; python -m pip install twine; python -m build --verbose'
             }
         }
         stage('Test') {
