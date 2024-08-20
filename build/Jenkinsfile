@@ -1,0 +1,22 @@
+pipeline {
+   agent {
+      label 'gcloud-build--rocky-linux-8--x64'
+    }
+    stages {
+        stage('Build') {
+            steps {
+                sh 'python3 --version;python3 -m pip install --upgrade pip; python3 -m pip install twine build; python3 -m build --verbose'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'echo None'
+            }
+        }
+        stage('Deploy') {
+            steps {
+                sh 'echo Nothing'
+            }
+        }
+    }
+}
