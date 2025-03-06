@@ -28,7 +28,6 @@ library is thread safe.
 Each VoltDB primitive type is mapped to a Python primitive type. The following
 table shows the mapping.
 
-   +------------------+
    |VoltDB   |Python  |
    |---------|--------|
    |NULL     |None    |
@@ -39,7 +38,6 @@ table shows the mapping.
    |FLOAT    |float   |
    |STRING   |string  |
    |DECIMAL  |decimal |
-   +------------------+
 
 Although Python does not distinguish between the different integer types, the
 size of the integer being serialized needs to fit the corresponding type.
