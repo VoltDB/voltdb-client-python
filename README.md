@@ -10,15 +10,10 @@ Python 3.6 or later.
 PLEASE NOTE
 
 The VoltDB Python client library has for some time now been included in
-the repository for VoltDB itself, VoltDB/voltdb. The present repository,
-VoltDB/voltdb-client-python, has been updated to contain code that is
-identical to the library for VoltDB V11.0. However, VoltDB recommends
-that to ensure you have the latest client code going forward, you get
-it from VoltDB/voltdb.
-
-The most recent VoltDB Python client library source code is at
-
-    https://github.com/VoltDB/voltdb/tree/master/lib/python
+the distribution kit for VoltDB, which is available to all VoltDB customers.
+The present repository, VoltDB/voltdb-client-python, is updated from time
+to time to match. If you have access to the VoltDB distribution kit, we
+recommend that you use the VoltDB client library from the kit.
 
 -------
 
