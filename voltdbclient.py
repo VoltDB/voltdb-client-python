@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # This file is part of VoltDB.
-# Copyright (C) 2008-2021 VoltDB Inc.
+# Copyright (C) 2008-2025 Volt Active Data Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -17,8 +17,14 @@
 
 import sys
 if sys.hexversion < 0x03060000:
-    raise Exception("Python version 3.6 or greater is required.")
+    # For now, we allow a minimum of 3.6 so that the current API can
+    # also be used on older systems. New features may not all be
+    # available when running on versions of Python older than 3.9.
+    # Volt applications using this API may enforce stricter limits.
+    raise Exception("Python version 3.6 or greater is required (3.9+ is preferred).")
+
 import array
+import atexit
 import socket
 import base64, textwrap
 import struct
@@ -29,6 +35,7 @@ import re
 import math
 import os
 import stat
+import time
 
 try:
     import ssl
@@ -36,18 +43,27 @@ try:
 except ImportError as e:
     ssl_available = False
     ssl_exception = e
-try:
-    import gssapi
-    kerberos_available = True
-except ImportError as e:
-    kerberos_available = False
-    kerberos_exception = e
+
 try:
     import jks
     pyjks_available = True
 except ImportError as e:
     pyjks_available = False
     pyjks_exception = e
+
+try:
+    from cryptography.hazmat.primitives.serialization import pkcs12, Encoding, PrivateFormat, NoEncryption
+    pkcs12_available = True
+except ImportError as e:
+    pkcs12_available = False
+    pkcs12_exception = e
+
+try:
+    import gssapi
+    kerberos_available = True
+except ImportError as e:
+    kerberos_available = False
+    kerberos_exception = e
 
 logger = None
 
@@ -130,6 +146,21 @@ class ReadBuffer(object):
         self.shift(size)
         return values
 
+unique_tag = '%x' % int(time.time() * 1000000)
+scratch_dir = None
+temporary_files = []
+
+def remove_temporary_files():
+    global temporary_files
+    for tf in temporary_files:
+        try:
+            os.unlink(tf)
+        except:
+            pass
+    temporary_files = []
+
+atexit.register(remove_temporary_files)
+
 class FastSerializer:
     "Primitive type de/serialization in VoltDB formats"
 
@@ -183,6 +214,7 @@ class FastSerializer:
     if (ssl_available):
         DEFAULT_SSL_CONFIG = {
         'keyfile': None,
+        'keypass': None,
         'certfile': None,
         'cert_reqs': ssl.CERT_NONE,
         'ca_certs': None,
@@ -191,15 +223,18 @@ class FastSerializer:
     else:
         DEFAULT_SSL_CONFIG = {}
 
-    def __init__(self, host = None, port = 21212, usessl = False,
-                 username = "", password = "",
+    def __init__(self, host = None,
+                 port = 21212,
+                 usessl = False,
+                 username = "",
+                 password = "",
                  kerberos = False,
                  dump_file_path = None,
                  connect_timeout = 8,
                  procedure_timeout = None,
                  default_timeout = None,
                  ssl_config_file = None,
-                 ssl_config = DEFAULT_SSL_CONFIG):
+                 default_cacerts = True):
         """
         :param host: host string for connection or None
         :param port: port for connection or None
@@ -212,6 +247,7 @@ class FastSerializer:
         :param procedure_timeout: timeout (secs) or None for procedure calls (default=None)
         :param default_timeout: default timeout (secs) or None for all other operations (default=None)
         :param ssl_config_file: config file that defines java keystore and truststore files
+        :param default_cacerts: if true, use installation default cacerts when truststore unspecified
         """
         # connect a socket to host, port and get a file object
         self.wbuf = array.array('B')
@@ -222,9 +258,10 @@ class FastSerializer:
             self.usekerberos = False
         else:
             self.usekerberos = kerberos
-        self.kerberosprinciple = None
-        self.ssl_config = ssl_config
+        self.kerberosprincipal = None
+        self.ssl_config = self.DEFAULT_SSL_CONFIG
         self.ssl_config_file = ssl_config_file
+        self.default_cacerts = default_cacerts and usessl
         if not dump_file_path is None:
             self.dump_file = open(dump_file_path, "wb")
         else:
@@ -253,7 +290,7 @@ class FastSerializer:
                 error("ERROR: Failed to connect to %s port %s" % (ai[4][0], ai[4][1]))
                 raise
             #if self.usessl:
-            #    print 'Cipher suite: ' + str(self.socket.cipher())
+            #    print('Cipher suite: ' + str(self.socket.cipher()))
 
         # input can be big or little endian
         self.inputBOM = self.BIG_ENDIAN  # byte order if input stream
@@ -328,7 +365,7 @@ class FastSerializer:
                 raise RuntimeError("Requested Kerberos authentication but no valid ticket found. Authenticate with Kerberos first.")
             assert not self.socket is None
             self.socket.settimeout(connect_timeout)
-            self.authenticate(str(self.kerberosprinciple), "")
+            self.authenticate(str(self.kerberosprincipal), "")
         elif not username is None and not password is None and not host is None:
             assert not self.socket is None
             self.socket.settimeout(connect_timeout)
@@ -339,106 +376,379 @@ class FastSerializer:
 
     # Front end to SSL socket support.
     #
-    # The SSL config file contains a sequence of key=value lines which
-    # are used to provide the arguments to the SSL wrap_socket call:
-    #   Key                Value                    Provides arguments
+    # The SSL config file can be one of:
+    # - a properties file (see below)
+    # - a truststore to verify server identity, in Java keystore format
+    # - a certificate chain to verify server identity, in PEM format
+    #
+    # "Java keystore" is either the traditional JKS keystore as created
+    # by the keytool program, or else a PKCS12 file, which is now the
+    # preferred output from keytool. Both are binary encodings.
+    #
+    # We initially look at the first few bytes of the file to decide
+    # what sort of file we are dealing with.
+    #
+    # A properties file contains a sequence of key=value lines which
+    # are used to provide arguments to the SSL context methods:
+    #   Key                Value                    Used in call to
     #   ------------------ ------------------------ ------------------
-    #   keystore           path to JKS keystore     keyfile, certfile
+    #   keystore           path to keystore         load_cert_chain
     #   keystorepassword   password for keystore    --
-    #   truststore         path to JKS truststore   ca_certs, cert_reqs
+    #   truststore         path to truststore       load_verify_locations
     #   truststorepassword password for truststore  --
-    #   cacerts            path to PEM cert chain   ca_certs, cert_reqs
+    #   cacerts            path to PEM cert chain   load_verify_locations
     #   ssl_version        ignored                  --
     #
-    # Thus keystore identifies the client (rarely needed), whereas truststore
-    # and cacerts identify the server. If truststore and cacerts are both
-    # specified, cacerts takes precedence.
+    # Thus keystore identifies the client (needed if mutual authentication
+    # is required by the server side), whereas truststore and cacerts
+    # identify the server. If truststore and cacerts are both specified,
+    # cacerts takes precedence.
     #
-    # An empty or missing ssl_config_file results in no certificate checks.
+    # Keystore can only be set via the properties file, and it can
+    # be a Java keystore with a single private key entry, or a PEM
+    # file containing a PKCS#8 private key and a chain of X.509
+    # certificates. Truststore can be set directly as the SSL
+    # config file, or via the properties file. Either way it can
+    # be a Java keystore or a PEM file, containing a chain of
+    # X.509 certificates.
+    #
+    # If the ssl_config_file name is absent or empty, then:
+    # - if default_cacerts is true, certficate checks will use the
+    #   installation default cacerts
+    # - if default_cacerts is false, no certificate checks will be
+    #   done; we will blindly accept the server's cert
 
     def __wrap_socket(self, ss):
         parsed_config = {}
-        jks_config = {}
         if self.ssl_config_file:
-            with open(os.path.expandvars(os.path.expanduser(self.ssl_config_file)), 'r') as f:
-                for line in f:
-                    try:
-                        l = line.strip()
-                        if l:
-                            k, v = l.split('=', 1)
-                            parsed_config[k.lower()] = v
-                    except:
-                        raise ValueError('Malformed line in SSL config: ' + line)
+            parsed_config = self.__process_ssl_config_file()
 
-        if ('keystore' in parsed_config and parsed_config['keystore']) or \
-           ('truststore' in parsed_config and parsed_config['truststore']):
-            self.__convert_jks_files(ss, parsed_config)
+        # Process keystore/truststore files; non-PEM files need conversion to PEM
+
+        keystore_type = truststore_type = None
+        if 'keystore' in parsed_config and parsed_config['keystore']:
+            keystore_type = self.__classify(parsed_config['keystore'])
+        if 'truststore' in parsed_config and parsed_config['truststore']:
+            truststore_type = self.__classify(parsed_config['truststore'])
+
+        store_type = keystore_type or truststore_type
+        if store_type:
+            if keystore_type and truststore_type and keystore_type != truststore_type:
+                raise RuntimeError("keystore file and truststore file must have same format")
+            elif store_type == 'pem':
+                self.__set_up_pem_files(parsed_config)
+            elif store_type == 'jks':
+                self.__convert_jks_files(parsed_config)
+            elif store_type == 'bin': # assumed to be pkcs12
+                self.__convert_pkcs12_files(parsed_config)
+            elif store_type == 'prop':
+                raise RuntimeError ("keystore or truststore path from property file is a property file")
+            else:
+                raise RuntimeError("internal error, unknown store type '%s'" % store_type)
+
+        # Additional cacerts (may supersede truststore)
 
         if 'cacerts' in parsed_config and parsed_config['cacerts']:
+            cacerts_type = self.__classify(parsed_config['cacerts'])
+            if cacerts_type != 'pem':
+                raise RuntimeError("cacerts file %s is not PEM format" % parsed_config['cacerts'])
             self.ssl_config['ca_certs'] = parsed_config['cacerts']
             self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
 
-        protocol = ssl.PROTOCOL_TLS
+        if self.default_cacerts:
+            self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
 
-        return ssl.wrap_socket(ss,
-                               keyfile=self.ssl_config['keyfile'],
-                               certfile=self.ssl_config['certfile'],
-                               server_side=False,
-                               cert_reqs=self.ssl_config['cert_reqs'],
-                               ssl_version=protocol,
-                               ca_certs=self.ssl_config['ca_certs'])
+        # convert ssl_config to python SSLContext and wrap socket
 
-    def __convert_jks_files(self, ss, jks_config):
+        context = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS)
+        context.verify_mode = self.ssl_config['cert_reqs']
+
+        if self.ssl_config['certfile']:
+            context.load_cert_chain(certfile=self.ssl_config['certfile'],
+                                    keyfile=self.ssl_config['keyfile'],
+                                    password=self.ssl_config['keypass'])
+
+        if self.ssl_config['cert_reqs'] != ssl.CERT_NONE:
+            if self.ssl_config['ca_certs']:
+                context.load_verify_locations(cafile=self.ssl_config['ca_certs'])
+            else:
+                context.load_default_certs()
+
+        if sys.hexversion >= 0x03070000:
+            protocols = os.getenv('TLS_ENABLED_PROTOCOLS')
+            if protocols:
+                min, max = self.__select_protocols(protocols)
+                if min and max:
+                    context.minimum_version = min
+                    context.maximum_version = max
+                else:
+                    print("TLS_ENABLED_PROTOCOLS ignored: no supported versions found")
+
+            ciphers = os.getenv('TLS_PREFERRED_CIPHERS')
+            if ciphers:
+                try:
+                    context.set_ciphers(self.__select_ciphers(context, ciphers))
+                except ssl.SSLError as ex:
+                    print("TLS_PREFERRED_CIPHERS ignored: %s" % ex)
+
+        return context.wrap_socket(ss)
+
+    def __process_ssl_config_file(self):
+        resolved_file = os.path.expandvars(os.path.expanduser(self.ssl_config_file))
+        file_type = self.__classify(resolved_file)
+        if file_type == 'prop':
+            properties = resolve_paths(read_properties_file(resolved_file, True))
+        elif file_type == 'pem':
+            properties = { 'cacerts': resolved_file }
+        elif file_type == 'jks' or file_type == 'bin':
+            properties = { 'truststore': resolved_file }
+        else:
+            raise RuntimeError('Unexpected file classification: %s' % file_type)
+        return properties
+
+    def __classify(self, file):
+        sample_size = 64
+        with open(file, mode='rb') as f:
+            buff = f.read(sample_size)
+        if len(buff) == sample_size:
+            if buff[:4] == bytes.fromhex('feedfeed'): # jks if starts with the right magic
+                return 'jks'
+            for b in buff: # binary if contains C0/C1 control except CR, LF, tab
+                if (b & 0x7f) < 0x20 and b != 0x0d and b != 0x0a and b != 0x09:
+                    return 'bin'
+        if buff.decode().startswith('-----BEGIN'):
+            return 'pem'
+        return 'prop' # compatible default
+
+    def __unique_name(self, path, cksum):
+        if not scratch_dir:
+            self.__set_scratch_dir()
+        base = os.path.basename(path) or 'noname'
+        return scratch_dir + '/' + base + '-' + cksum + '-' + unique_tag
+
+    def __set_scratch_dir(self):
+        global scratch_dir
+        try:
+            dir = os.path.expanduser('~/.voltssl')
+            if dir[0] != '~': # expanded ok
+                if not os.path.exists(dir):
+                     os.mkdir(dir, stat.S_IRUSR|stat.S_IWUSR|stat.S_IXUSR)
+                scratch_dir = dir
+        except: # mkdir failed
+            pass
+        if not scratch_dir:
+            scratch_dir = os.getenv('TMPDIR', '/tmp')
+
+    def __set_up_pem_files(self, pem_config):
+        use_ks = 'keystore' in pem_config and pem_config['keystore']
+        use_ts = 'truststore' in pem_config and pem_config['truststore']
+        if use_ks:
+            if self.__has_cert(pem_config['keystore']) or not use_ts:
+                self.ssl_config['keyfile'] = None
+                self.ssl_config['certfile'] = pem_config['keystore']
+            else: # key and cert in separate file
+                self.ssl_config['keyfile'] = pem_config['keystore']
+                self.ssl_config['certfile'] = pem_config['truststore']
+            self.ssl_config['keypass'] = pem_config.get('keystorepassword')
+        if use_ts:
+            self.ssl_config['ca_certs'] = pem_config['truststore']
+            self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
+
+    def __has_cert(self, keyfile):
+        with open(keyfile, 'r') as f:
+            data = f.read()
+        return 'CERTIFICATE' in data
+
+    def __convert_jks_files(self, jks_config):
         if not pyjks_available:
-            error("To use Java KeyStore please install the 'pyjks' module")
+            if os.getenv('VOLTDB_CONTAINER'):
+                print("Java KeyStore support is unavailable in this container.\n" +
+                      "You can use --ssl=nocheck to skip verification of the server certificate.\n");
+            else:
+                error("To use Java KeyStore please install the 'pyjks' module.\n" +
+                      "It may be more convenient to use a PEM file instead.\n");
             raise pyjks_exception
+
+        def load_keystore(filename, password):
+            with open(filename, 'rb') as f:
+               data = f.read()
+            ks = jks.KeyStore.loads(data, password)
+            cksum = hashlib.md5(data).hexdigest()
+            return ks, cksum
 
         def write_pem(der_bytes, type, f):
             f.write("-----BEGIN %s-----\n" % type)
             f.write("\r\n".join(textwrap.wrap(base64.b64encode(der_bytes).decode('ascii'), 64)))
             f.write("\n-----END %s-----\n" % type)
 
-        # extract key and certs
+        # extract key and certs from jks keystore with cacheing
         use_key_cert = False
-        if 'keystore' in jks_config and jks_config['keystore'] and \
-               'keystorepassword' in jks_config and jks_config['keystorepassword']:
-            ks = jks.KeyStore.load(jks_config['keystore'], jks_config['keystorepassword'])
-            keyfile = self.__create(jks_config['keystore'] + '.key.pem')
-            certfile = self.__create(jks_config['keystore'] + '.cert.pem')
-            for alias, pk in list(ks.private_keys.items()):
-                # print("Private key: %s" % pk.alias)
-                if pk.algorithm_oid == jks.util.RSA_ENCRYPTION_OID:
-                    write_pem(pk.pkey, "RSA PRIVATE KEY", keyfile)
-                else:
-                    write_pem(pk.pkey_pkcs8, "PRIVATE KEY", keyfile)
+        if 'keystore' in jks_config and jks_config['keystore']:
+            kpass = jks_config.get('keystorepassword')
+            ks, cksum = load_keystore(jks_config['keystore'], kpass)
+            kfname = self.__unique_name(jks_config['keystore'], cksum)
+            keyfilename = kfname + '.key.pem'
+            certfilename = kfname + '.cert.pem'
 
-                for c in pk.cert_chain:
-                    write_pem(c[1], "CERTIFICATE", certfile)
-                use_key_cert = True
-            keyfile.close()
-            certfile.close()
+            if os.path.exists(keyfilename) and os.path.exists(certfilename):
+                use_key_cert = os.path.getsize(certfilename) > 0
+            else:
+                keyfile = self.__create_temp(keyfilename)
+                certfile = self.__create_temp(certfilename)
+                for alias, pk in list(ks.private_keys.items()):
+                    # print("Private key: %s" % pk.alias)
+                    if pk.algorithm_oid == jks.util.RSA_ENCRYPTION_OID:
+                        write_pem(pk.pkey, "RSA PRIVATE KEY", keyfile)
+                    else:
+                        write_pem(pk.pkey_pkcs8, "PRIVATE KEY", keyfile)
+                    for c in pk.cert_chain:
+                        write_pem(c[1], "CERTIFICATE", certfile)
+                    use_key_cert = True
+                keyfile.close()
+                certfile.close()
+
             if use_key_cert:
-                self.ssl_config['keyfile'] = keyfile.name
-                self.ssl_config['certfile'] = certfile.name
+                self.ssl_config['keyfile'] = keyfilename
+                self.ssl_config['certfile'] = certfilename
 
-        # extract ca certs
+        # extract ca certs from jks truststore with cacheing
         use_ca_cert = False
-        if 'truststore' in jks_config and jks_config['truststore'] and \
-               'truststorepassword' in jks_config and jks_config['truststorepassword']:
-            ts = jks.KeyStore.load(jks_config['truststore'], jks_config['truststorepassword'])
-            cafile = self.__create(jks_config['truststore'] + '.ca.cert.pem')
-            for alias, c in list(ts.certs.items()):
-                # print("Certificate: %s" % c.alias)
-                write_pem(c.cert, "CERTIFICATE", cafile)
-                use_ca_cert = True
-            cafile.close()
+        if 'truststore' in jks_config and jks_config['truststore']:
+            tpass = jks_config.get('truststorepassword')
+            ts, cksum = load_keystore(jks_config['truststore'], tpass)
+            tfname = self.__unique_name(jks_config['truststore'], cksum)
+            cafilename = tfname + '.ca.cert.pem'
+
+            if os.path.exists(cafilename):
+                use_ca_cert = os.path.getsize(cafilename) > 0
+            else:
+                cafile = self.__create_temp(cafilename)
+                for alias, c in list(ts.certs.items()):
+                    # print("Certificate: %s" % c.alias)
+                    write_pem(c.cert, "CERTIFICATE", cafile)
+                    use_ca_cert = True
+                cafile.close()
+
             if use_ca_cert:
-                self.ssl_config['ca_certs'] = cafile.name
+                self.ssl_config['ca_certs'] = cafilename
                 self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
 
-    def __create(self, filename):
+    def __convert_pkcs12_files(self, p12_config):
+        if not pkcs12_available:
+            if os.getenv('VOLTDB_CONTAINER'):
+                print("PKCS12 certificate support is unavailable in this container.\n" +
+                      "You can use --ssl=nocheck to skip verification of the server certificate.\n");
+            else:
+                error("To use PKCS12 certificate support please install the 'cryptography' module.\n" +
+                      "It may be more convenient to use a PEM file instead.\n");
+            raise pkcs12_exception
+
+        def checksum(fname):
+            with open(fname, 'rb') as f:
+               data = f.read()
+            return hashlib.md5(data).hexdigest()
+
+        def write_private_key(fname, key):
+            with self.__create_temp(fname) as f:
+                f.write(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode('ascii'))
+
+        def write_cert_chain(fname, cert, more):
+            with self.__create_temp(fname) as f:
+                if cert:
+                    f.write(cert.public_bytes(Encoding.PEM).decode('ascii'))
+                if more:
+                    for cert in more:
+                        f.write(cert.public_bytes(Encoding.PEM).decode('ascii'))
+
+        # pkcs12 keystore file to PEM files: private key and certificate
+        use_key_cert = False
+        if 'keystore' in p12_config and p12_config['keystore']:
+            kpass = p12_config.get('keystorepassword')
+            if kpass: kpass = kpass.encode('utf-8')
+            kfname = self.__unique_name(p12_config['keystore'], checksum(p12_config['keystore']))
+            keyfilename = kfname + '.key.pem'
+            certfilename = kfname + '.cert.pem'
+
+            if os.path.exists(keyfilename) and os.path.exists(certfilename):
+                use_key_cert = os.path.getsize(certfilename) > 0
+            else:
+                with open(p12_config['keystore'], 'rb') as f:
+                    keystore = pkcs12.load_key_and_certificates(f.read(), kpass)
+                if not keystore[0]:
+                    raise RuntimeError('No private key entry in keystore')
+                if not keystore[1]:
+                    raise RuntimeError('No certificate entry in keystore')
+                write_private_key(keyfilename, keystore[0])
+                write_cert_chain(certfilename, keystore[1], keystore[2])
+                use_key_cert = True
+
+            if use_key_cert:
+                self.ssl_config['keyfile'] = keyfilename
+                self.ssl_config['certfile'] = certfilename
+
+        # pkcs12 truststore to single PEM file with cert chain
+        use_ca_cert = False
+        if 'truststore' in p12_config and p12_config['truststore']:
+            tpass = p12_config.get('truststorepassword')
+            if tpass: tpass = tpass.encode('utf-8')
+            tfname = self.__unique_name(p12_config['truststore'], checksum(p12_config['truststore']))
+            cafilename = tfname + '.ca.cert.pem'
+
+            if os.path.exists(cafilename):
+                use_ca_cert = os.path.getsize(cafilename) > 0
+            else:
+                with open(p12_config['truststore'], 'rb') as f:
+                    truststore = pkcs12.load_key_and_certificates(f.read(), tpass)
+                if not (truststore[1] or truststore[2]):
+                    raise RuntimeError('No certificates in truststore')
+                write_cert_chain(cafilename, truststore[1], truststore[2])
+                use_ca_cert = True
+
+            if use_ca_cert:
+                self.ssl_config['ca_certs'] = cafilename
+                self.ssl_config['cert_reqs'] = ssl.CERT_REQUIRED
+
+    __protodict = { }
+    if ssl_available and sys.hexversion >= 0x03070000: # for ssl.TLSVersion
+        __protodict = { 'TLSv1.2': ssl.TLSVersion.TLSv1_2,
+                        'TLSv1.3': ssl.TLSVersion.TLSv1_3 }
+
+    def __select_protocols(self, protstr):
+        proto = [ self.__protodict[p] for p in protstr.split(',')
+                                      if p in self.__protodict ]
+        return (min(proto), max(proto)) if proto else (None, None)
+
+    def __select_ciphers(self, context, namestr):
+        supported = list(c['name'] for c in context.get_ciphers())
+        selected = []
+        for name in namestr.split(','):
+            if name in supported:
+                selected.append(name)
+            else:
+                name2 = self.__java_to_openssl_cipher(name)
+                if name2 in supported:
+                    selected.append(name2)
+        return ':'.join(selected)
+
+    __tlspattern = re.compile(r'^TLS_(.*)_WITH_(.*)_(.*)$')
+    __aespattern = re.compile(r'^(AES)-(\d*)(-.*)$')
+
+    def __java_to_openssl_cipher(self, name):
+        m = self.__tlspattern.match(name)
+        if not m:
+            return name
+        handshake = m.group(1).replace('_','-')
+        cipher = m.group(2).replace('_','-')
+        hmac = m.group(3)
+        m = self.__aespattern.match(cipher)
+        if m:
+            cipher = m.group(1) + m.group(2) + m.group(3)
+        return handshake + '-' + cipher + '-' + hmac
+
+    def __create_temp(self, filename):
         f = open(filename, 'w')
         os.chmod(filename, stat.S_IRUSR|stat.S_IWUSR)
+        temporary_files.append(filename)
         return f
 
     def __compileStructs(self):
@@ -490,11 +800,19 @@ class FastSerializer:
         self.prependLength()
         self.flush()
 
+        ioerror_message = "ERROR: Connection failed. Please check that the host, port, and ssl settings are correct."
+        sslerror_message = "ERROR: Connection failed due to a problem with TLS/SSL, possibly a configuration msismatch."
+
         # A length, version number, and status code is returned
+        # If there was a problem with ssl handshaking it will probably show up
+        # on this first read
         try:
             self.bufferForRead()
+        except ssl.SSLError as e:
+            error(sslerror_message)
+            raise e
         except IOError as e:
-            error("ERROR: Connection failed. Please check that the host, port, and ssl settings are correct.")
+            error(ioerror_message)
             raise e
         except socket.timeout:
             raise RuntimeError("Authentication timed out after %d seconds."
@@ -520,7 +838,7 @@ class FastSerializer:
                     try:
                         self.bufferForRead()
                     except IOError as e:
-                        error("ERROR: Connection failed. Please check that the host, port, and ssl settings are correct.")
+                        error(ioerror_message)
                         raise e
                     except socket.timeout:
                         raise RuntimeError("Authentication timed out after %d seconds."
@@ -536,7 +854,7 @@ class FastSerializer:
                 try:
                     self.bufferForRead()
                 except IOError as e:
-                    error("ERROR: Connection failed. Please check that the host, port, and ssl settings are correct.")
+                    error(ioerror_message)
                     raise e
                 except socket.timeout:
                     raise RuntimeError("Authentication timed out after %d seconds."
@@ -549,7 +867,18 @@ class FastSerializer:
 
 
         if status != 0:
-            raise RuntimeError("Authentication failed.")
+            reason = "Authentication failed."
+            # Must match assignments in Constants.java
+            status_text = ("Server has too many connections.",
+                           "Connection timed out during authentication.",
+                           "Wire protocol format violation error.",
+                           "Failed to authenticate to rejoining node.",
+                           "Export not enabled for server.",
+                           "Server requires use of TLS/SSL.",
+                           "Client certificate required for mutual authentication.")
+            if status > 0 and status <= len(status_text):
+                reason = status_text[status-1]
+            raise RuntimeError(reason)
 
         self.readInt32()
         self.readInt64()
@@ -567,7 +896,7 @@ class FastSerializer:
         try:
             default_cred = gssapi.creds.Credentials(usage='initiate')
             if default_cred.lifetime > 0:
-                self.kerberosprinciple = str(default_cred.name)
+                self.kerberosprincipal = str(default_cred.name)
                 retval = True
             else:
                 error("ERROR: Kerberos principal found but login expired.")
@@ -603,7 +932,7 @@ class FastSerializer:
     def flush(self):
         if self.socket is None:
             error("ERROR: not connected to server.")
-            exit(-1)
+            raise IOError("No Connection")
 
         if self.dump_file != None:
             self.dump_file.write(self.wbuf)
@@ -614,7 +943,7 @@ class FastSerializer:
     def bufferForRead(self):
         if self.socket is None:
             error("ERROR: not connected to server.")
-            exit(-1)
+            raise IOError("No Connection")
 
         # fully buffer a new length preceded message from socket
         # read the length. the read until the buffer is completed.
@@ -639,14 +968,14 @@ class FastSerializer:
     def read(self, type):
         if type not in self.READER:
             error("ERROR: can't read wire type(%d) yet." % (type))
-            exit(-2)
+            raise IOError("ERROR: can't read wire type(%d) yet." % (type))
 
         return self.READER[type]()
 
     def write(self, type, value):
         if type not in self.WRITER:
             error("ERROR: can't write wire type(%d) yet." % (type))
-            exit(-2)
+            raise IOError("ERROR: can't write wire type(%d) yet." % (type))
 
         return self.WRITER[type](value)
 
@@ -657,7 +986,7 @@ class FastSerializer:
     def writeWireType(self, type, value):
         if type not in self.WRITER:
             error("ERROR: can't write wire type(%d) yet." % (type))
-            exit(-2)
+            raise IOError("ERROR: can't write wire type(%d) yet." % (type))
 
         self.writeByte(type)
         return self.write(type, value)
@@ -677,7 +1006,7 @@ class FastSerializer:
     def readArray(self, type):
         if type not in self.ARRAY_READER:
             error("ERROR: can't read wire type(%d) yet." % (type))
-            exit(-2)
+            raise IOError("ERROR: can't write wire type(%d) yet." % (type))
 
         return self.ARRAY_READER[type]()
 
@@ -692,8 +1021,8 @@ class FastSerializer:
             return
 
         if type not in self.ARRAY_READER:
-            error("ERROR: Unsupported date type (%d)." % (type))
-            exit(-2)
+            error("ERROR: Unsupported data type (%d)." % (type))
+            raise IOError("ERROR: Unsupported data type (%d)." % (type))
 
         # serialize arrays of bytes as larger values to support
         # strings and varbinary input
@@ -708,7 +1037,7 @@ class FastSerializer:
     def writeWireTypeArray(self, type, array):
         if type not in self.ARRAY_READER:
             error("ERROR: can't write wire type(%d) yet." % (type))
-            exit(-2)
+            raise IOError("ERROR: can't write wire type(%d) yet." % (type))
 
         self.writeByte(type)
         self.writeArray(type, array)
@@ -1618,15 +1947,11 @@ class VoltProcedure:
         self.fser.writeInt64(1)            # client handle
         self.fser.writeInt16(len(self.paramtypes))
         for i in range(len(self.paramtypes)):
-            try:
-                iter(params[i]) # Test if this is an array
-                if isinstance(params[i], str): # String is a special case
-                    raise TypeError
-
+            if self.as_array(self.paramtypes[i], params[i]):
                 self.fser.writeByte(FastSerializer.ARRAY)
                 self.fser.writeByte(self.paramtypes[i])
                 self.fser.writeArray(self.paramtypes[i], params[i])
-            except TypeError:
+            else:
                 self.fser.writeWireType(self.paramtypes[i], params[i])
         self.fser.prependLength() # prepend the total length of the invocation
         self.fser.flush()
@@ -1651,3 +1976,46 @@ class VoltProcedure:
         finally:
             self.fser.socket.settimeout(original_timeout)
         return response and res or None
+
+    def as_array(self, paramtype, param):
+        try:
+            iter(param) # throws TypeError if not a python array type
+            if isinstance(param, str):
+                return False
+            if isinstance(param, bytes) or isinstance(param, bytearray):
+                return paramtype != FastSerializer.VOLTTYPE_VARBINARY # as non-array if we want varbinary
+            return True
+        except TypeError:
+            return False
+
+# Reads a properties file that is broadly compatible
+# with the forms supported by Java, in particular for
+# allowable separators between key and value. Note,
+# the key can optionally be converted to lower case
+# for compatibility with the previous implementation.
+
+def read_properties_file(filename, lowerkeys=False):
+    separator = re.compile(r'\s*[=:]\s*|\s+')
+    properties = {}
+    count = 0
+    with open(filename, mode='rt', encoding='utf-8') as f:
+        for line in f:
+            count = count + 1
+            line = line.strip()
+            if line and line[0] != '#' and line[0] != '!':
+                m = separator.search(line)
+                if m and m.start() > 0:
+                    key = line[:m.start()]
+                    val = line[m.end():]
+                    properties[key.lower() if lowerkeys else key] = val
+                else:
+                    raise ValueError('Malformed property at line %s in %s: %s' % (count, filename, line))
+    return properties
+
+# Expand leading ~ in known pathnames from properties
+
+def resolve_paths(properties):
+    for key in ('keystore', 'truststore', 'cacerts'):
+        if key in properties and properties[key].startswith('~'):
+            properties[key] = os.path.expanduser(properties[key])
+    return properties

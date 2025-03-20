@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # This file is part of VoltDB.
-# Copyright (C) 2008-2021 VoltDB Inc.
+# Copyright (C) 2008-2024 Volt Active Data Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -17,7 +17,10 @@
 
 import sys
 if sys.hexversion < 0x03060000:
-    raise Exception("Python version 3.6 or greater is required.")
+    # For now, voltdbclient allows a minimum of 3.6 so that the
+    # current API cab also be used on older systems. New features
+    # may not all be available on versions of Python older than 3.9.
+    raise Exception("Python version 3.6 or greater is required (3.9+ is preferred).")
 
 import cmd
 import socket
@@ -532,4 +535,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 3:
         command.onecmd(" ".join(sys.argv[3:]))
     else:
-        command.cmdloop("VoltDB Query Client")
+        command.cmdloop("DB Query Client")
