@@ -5,15 +5,9 @@ wire protocol. It provides the functionality of connecting to a VoltDB server,
 authenticating the client, and making procedure calls.  The client supports
 Python 3.6 or later.
 
--------
-
-PLEASE NOTE
-
-The VoltDB Python client library has for some time now been included in
-the distribution kit for VoltDB, which is available to all VoltDB customers.
-The present repository, VoltDB/voltdb-client-python, is updated from time
-to time to match. If you have access to the VoltDB distribution kit, we
-recommend that you use the VoltDB client library from the kit.
+The Python client library is a single file, voltdbclient.py, contained in the VoltDB distribution
+tarball. This pypi package is provided for the convenience of users who don't need the
+full VoltDB distribution.
 
 -------
 
@@ -136,10 +130,21 @@ running on port 21212 on localhost, and make a single call to the stored
 procedure named "Select", which takes a single parameter of type string. Assume
 the server is not secure, so that it does not require authentication.
 
+    >>> from voltdbclient import *
     >>> client = FastSerializer("localhost", 21212)
-    >>> proc = VoltProcedure(client, "Select", [FastSerializer.VOLTTYPE_STRING])
-    >>> response = proc.call(["English"])
+    >>> proc = VoltProcedure(client, "@SystemInformation", [FastSerializer.VOLTTYPE_STRING])
+    >>> response = proc.call(["OVERVIEW"])
     >>> client.close()
-    >>> print response
+    >>> print (response)
 
 The output will be a human-readable form of the VoltResponse object.
+
+## Installation
+
+You can install the package via **PyPI** or from **source**.
+
+### Install from PyPI
+
+```bash
+pip install voltdbclient
+```
