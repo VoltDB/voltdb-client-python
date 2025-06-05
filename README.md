@@ -143,8 +143,37 @@ The output will be a human-readable form of the VoltResponse object.
 
 You can install the package via **PyPI** or from **source**.
 
-### Install from PyPI
+### Install from PyPI system-wide
 
 ```bash
 pip install voltdbclient
 ```
+
+### Install in a Virtual Environment 
+
+It is recommended to use isolated self-contained virtual env per individual Python projects.
+Below example show how to set up such an env using the _**venv**_ library that is included in 
+python3 distribution. 
+
+Pre-requisites and naming conventions:
+* you have python3 installed
+* to run provided examples - you have the 'voldb-client-python' project downloaded locally
+  * CLIENT_HOME refers to the path of your local 'voldb-client-python' project
+* 'voltdb_venv_p3' is the name of your venv environment - can be anything
+
+Commands below will create a new virtual env 'voltdb_venv_p3',
+which will result in a subdirectory of that name created in the CLIENT_HOME dir, activate the env, 
+and install the voltdbclient in that venv
+
+```bash
+cd CLIENT_HOME
+python3 -m venv voltdb_venv_p3
+source voltdb_venv_p3/bin/activate
+pip install voltdbclient
+```
+
+Once the ven is created and the client is installed - you can create a new project in a PyCharm 
+(or your IDE of choice) and use the new venv as the Python Interpreter for the project.
+Here is an example of what this might look like in PyCharm:
+
+![python_client_pycharm_project](python_client_pycharm_project.jpg)
