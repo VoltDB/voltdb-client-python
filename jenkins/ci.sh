@@ -16,6 +16,8 @@
 #   jenkins/ci.sh checksum               dist/SHA256SUMS
 #   jenkins/ci.sh upload testpypi|pypi   twine upload dist/* (token in $TWINE_PASSWORD)
 #   jenkins/ci.sh verify testpypi|pypi   the index serves exactly the files in dist/
+#   jenkins/ci.sh download testpypi|pypi the version's wheel and sdist from the index
+#                                        into dist/, checked against its sha256s
 #
 # Images come from mirror.gcr.io, Google's Docker Hub mirror, so pulls need no
 # Docker Hub login and no credential is ever present while PR code runs.
@@ -168,7 +170,7 @@ cmd_upload() {
     in_python "$BUILD_PYTHON" "
         python -m venv /tmp/venv
         /tmp/venv/bin/pip install -q twine
-        /tmp/venv/bin/twine upload --non-interactive --repository-url ${url} \
+        /tmp/venv/bin/twine upload --non-interactive --verbose --repository-url ${url} \
             dist/*.whl dist/*.tar.gz"
 }
 
@@ -214,6 +216,41 @@ if bad or extra:
 EOF"
 }
 
+cmd_download() {
+    local index=${1:-}
+    local url version
+    url="$(index_url "$index" json)" || exit 1
+    version=$(project_version)
+    rm -rf dist
+    mkdir dist
+    in_python "$BUILD_PYTHON" "
+        python - <<'EOF'
+import hashlib, json, sys, urllib.error, urllib.request
+
+try:
+    with urllib.request.urlopen('${url}/${PROJECT}/${version}/json', timeout=30) as r:
+        files = json.load(r)['urls']
+except urllib.error.HTTPError as e:
+    if e.code == 404:
+        sys.exit('ERROR: ${PROJECT} ${version} is not on ${index}')
+    raise
+names = sorted(f['filename'] for f in files)
+expected = sorted(['${PROJECT}-${version}-py3-none-any.whl', '${PROJECT}-${version}.tar.gz'])
+if names != expected:
+    sys.exit('ERROR: ${index} serves %s for ${version}, expected %s' % (names, expected))
+for f in files:
+    with urllib.request.urlopen(f['url'], timeout=60) as r:
+        data = r.read()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != f['digests']['sha256']:
+        sys.exit('ERROR: %s downloaded with sha256 %s, but ${index} lists %s'
+                 % (f['filename'], digest, f['digests']['sha256']))
+    with open('dist/' + f['filename'], 'wb') as out:
+        out.write(data)
+    print('%s  %s  downloaded from ${index}' % (digest, f['filename']))
+EOF"
+}
+
 command=${1:-}
 [ $# -gt 0 ] && shift
 case "$command" in
@@ -224,5 +261,6 @@ case "$command" in
     checksum)    cmd_checksum "$@" ;;
     upload)      cmd_upload "$@" ;;
     verify)      cmd_verify "$@" ;;
+    download)    cmd_download "$@" ;;
     *)           sed -n '/^# Build, test and publish/,/^$/s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
 esac

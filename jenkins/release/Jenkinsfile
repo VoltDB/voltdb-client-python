@@ -17,6 +17,12 @@
 // The release commit is reachable only from the tag: master keeps its .dev
 // version, and moving it to the next one is an ordinary pull request.
 //
+// MODE=promote publishes an existing release, tagged and on TestPyPI, to PyPI
+// without rebuilding it: it downloads the wheel and the sdist from TestPyPI,
+// checks them against TestPyPI's hashes, runs the tests on that wheel, and
+// after a person approves uploads the same files to PyPI. It never builds,
+// tags, or uploads to TestPyPI.
+//
 // The build description shows the wheel's sha256. That value, not one read
 // back from PyPI, goes into volt-python-client/client.properties in the VoltDB
 // server repository, whose build bundles the client into the distribution.
@@ -46,6 +52,12 @@ pipeline {
     }
 
     parameters {
+        choice(name: 'MODE',
+               choices: ['release', 'promote'],
+               description: '''release: build SOURCE_REF as RELEASE_VERSION, test, tag, and publish as PUBLISH_TO says.
+promote: publish RELEASE_VERSION, already tagged and on TestPyPI, to PyPI: the files TestPyPI serves,
+checked against its hashes and tested, after a person approves. SOURCE_REF only supplies the tooling;
+PUBLISH_TO is ignored.''')
         string(name: 'RELEASE_VERSION',
                defaultValue: '',
                description: '''Version to release: X.Y.Z, or a pre-release X.Y.ZaN, X.Y.ZbN or X.Y.ZrcN.
@@ -56,11 +68,12 @@ file twice, so a failed release continues with the next version (rc2 after rc1, 
                description: 'Branch to build and tag.')
         choice(name: 'PUBLISH_TO',
                choices: ['testpypi', 'pypi'],
-               description: '''testpypi: publish to TestPyPI only.
+               description: '''MODE=release only.
+testpypi: publish to TestPyPI only.
 pypi: publish to TestPyPI, then to PyPI after a person approves.''')
         booleanParam(name: 'DRY_RUN',
                      defaultValue: true,
-                     description: 'Build and test only: no tag, no upload.')
+                     description: 'Stop before tagging or uploading: release builds and tests; promote downloads, checks and tests.')
     }
 
     environment {
@@ -85,9 +98,16 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
                     }
                     env.VERSION = version
                     env.TAG = "v${version}"
-                    def mode = params.DRY_RUN ? 'DRY RUN' : params.PUBLISH_TO
-                    currentBuild.displayName = "#${env.BUILD_NUMBER} - ${env.TAG} - ${mode}"
-                    echo "Release ${env.VERSION} from ${params.SOURCE_REF}, tag ${env.TAG}, mode ${mode}"
+                    // A build started before Jenkins knew the MODE parameter has none.
+                    env.PROMOTE = (params.MODE ?: 'release') == 'promote' ? 'true' : 'false'
+                    def mode = env.PROMOTE == 'true' ? 'promote to pypi' : params.PUBLISH_TO
+                    env.MODE_LABEL = params.DRY_RUN ? "DRY RUN (${mode})" : mode
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} - ${env.TAG} - ${env.MODE_LABEL}"
+                    if (env.PROMOTE == 'true') {
+                        echo "Promote ${env.VERSION} (tag ${env.TAG}) from TestPyPI to PyPI, mode ${env.MODE_LABEL}"
+                    } else {
+                        echo "Release ${env.VERSION} from ${params.SOURCE_REF}, tag ${env.TAG}, mode ${env.MODE_LABEL}"
+                    }
                 }
             }
             post {
@@ -118,20 +138,26 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
                             export GIT_SSH_COMMAND="ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
                             git ls-remote --exit-code --tags origin "refs/tags/${TAG}"
                         ''')
-                        if (rc == 0) {
-                            error("Tag ${env.TAG} already exists. Release a new version.")
-                        }
-                        if (rc != 2) {
+                        if (rc != 0 && rc != 2) {
                             error("Could not list the repository's tags (git ls-remote exited ${rc})")
                         }
+                        if (env.PROMOTE == 'true') {
+                            if (rc == 2) {
+                                error("Tag ${env.TAG} does not exist. Promote publishes an existing release.")
+                            }
+                        } else {
+                            if (rc == 0) {
+                                error("Tag ${env.TAG} already exists. Release a new version.")
+                            }
+                            // Fail now, before anything is built or uploaded, if the key cannot
+                            // push to this repository. --dry-run asks GitHub for push access
+                            // and creates nothing, so a DRY_RUN checks it too.
+                            sh '''
+                                export GIT_SSH_COMMAND="ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
+                                git push --dry-run origin "HEAD:refs/tags/${TAG}"
+                            '''
+                        }
                     }
-                    // Fail now, before anything is built or uploaded, if the key cannot
-                    // push to this repository. --dry-run asks GitHub for push access
-                    // and creates nothing, so a DRY_RUN checks it too.
-                    sh '''
-                        export GIT_SSH_COMMAND="ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
-                        git push --dry-run origin "HEAD:refs/tags/${TAG}"
-                    '''
                 }
                 script {
                     echo "${params.SOURCE_REF} @ " + sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
@@ -147,23 +173,30 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
             // The release commit sits on top of SOURCE_REF and is never pushed to a
             // branch; the tag, created after the tests pass, is what keeps it.
             steps {
-                script { startedStage('Set Release Version') }
-                sh '''
-                    jenkins/ci.sh set-version "${VERSION}"
-                    git config user.email "ci-release-bot@voltactivedata.com"
-                    git config user.name  "voltdb-release-bot"
-                    if git diff --quiet -- pyproject.toml; then
-                        echo "pyproject.toml on ${SOURCE_REF} is already ${VERSION}; tagging it as it is"
-                    else
-                        git commit -q -m "Set version to ${VERSION} for release ${TAG}" pyproject.toml
-                    fi
-                    echo "release commit: $(git rev-parse --short HEAD)"
-                '''
-                // Fail before building anything if an index already has this version.
-                sh 'jenkins/ci.sh unpublished testpypi'
                 script {
-                    if (params.PUBLISH_TO == 'pypi') {
+                    startedStage('Set Release Version')
+                    if (env.PROMOTE == 'true') {
+                        // The files come from TestPyPI. The version is stamped only so that
+                        // ci.sh names them; nothing is committed.
+                        sh 'jenkins/ci.sh set-version "${VERSION}"'
                         sh 'jenkins/ci.sh unpublished pypi'
+                    } else {
+                        sh '''
+                            jenkins/ci.sh set-version "${VERSION}"
+                            git config user.email "ci-release-bot@voltactivedata.com"
+                            git config user.name  "voltdb-release-bot"
+                            if git diff --quiet -- pyproject.toml; then
+                                echo "pyproject.toml on ${SOURCE_REF} is already ${VERSION}; tagging it as it is"
+                            else
+                                git commit -q -m "Set version to ${VERSION} for release ${TAG}" pyproject.toml
+                            fi
+                            echo "release commit: $(git rev-parse --short HEAD)"
+                        '''
+                        // Fail before building anything if an index already has this version.
+                        sh 'jenkins/ci.sh unpublished testpypi'
+                        if (params.PUBLISH_TO == 'pypi') {
+                            sh 'jenkins/ci.sh unpublished pypi'
+                        }
                     }
                 }
             }
@@ -174,6 +207,7 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
         }
 
         stage('Build') {
+            when { expression { return env.PROMOTE != 'true' } }
             steps {
                 script { startedStage('Build') }
                 sh 'jenkins/ci.sh build'
@@ -184,8 +218,23 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
             }
         }
 
+        stage('Download from TestPyPI') {
+            // Promote: the exact files TestPyPI serves, each checked against the
+            // sha256 TestPyPI lists for it.
+            when { expression { return env.PROMOTE == 'true' } }
+            steps {
+                script { startedStage('Download from TestPyPI') }
+                sh 'jenkins/ci.sh download testpypi'
+            }
+            post {
+                success { successfulStage('Download from TestPyPI') }
+                failure { failedStage('Download from TestPyPI') }
+            }
+        }
+
         stage('Test') {
-            // The release commit is new, so no earlier test run covers it.
+            // Release: the release commit is new, so no earlier test run covers it.
+            // Promote: tests the very wheel that goes to PyPI.
             steps {
                 script { startedStage('Test') }
                 sh 'jenkins/ci.sh test ${PYTHON_VERSIONS}'
@@ -213,7 +262,7 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
                     }
                     currentBuild.description = """
                         <b>Tag:</b> ${env.TAG}<br/>
-                        <b>Mode:</b> ${params.DRY_RUN ? 'DRY RUN' : params.PUBLISH_TO}<br/>
+                        <b>Mode:</b> ${env.MODE_LABEL}<br/>
                         <b>Pin for client.properties:</b><br/>
                         voltdbclient.version=${env.VERSION}<br/>
                         voltdbclient.sha256=${env.WHEEL_SHA256}
@@ -229,7 +278,12 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
         stage('Publish Tag') {
             // After the tests, before any upload: a tag can never name code that
             // failed, and a release is never uploaded without its tag.
-            when { expression { return !params.DRY_RUN } }
+            when {
+                allOf {
+                    expression { return !params.DRY_RUN }
+                    expression { return env.PROMOTE != 'true' }
+                }
+            }
             steps {
                 script { startedStage('Publish Tag') }
                 withCredentials([sshUserPrivateKey(credentialsId: 'jenkins-for-devs-github-ssh-key',
@@ -249,7 +303,12 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
         }
 
         stage('Publish to TestPyPI') {
-            when { expression { return !params.DRY_RUN } }
+            when {
+                allOf {
+                    expression { return !params.DRY_RUN }
+                    expression { return env.PROMOTE != 'true' }
+                }
+            }
             steps {
                 script { startedStage('Publish to TestPyPI') }
                 // Username with password: the API token is the password, as in
@@ -271,7 +330,7 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
             when {
                 allOf {
                     expression { return !params.DRY_RUN }
-                    expression { return params.PUBLISH_TO == 'pypi' }
+                    expression { return params.PUBLISH_TO == 'pypi' || env.PROMOTE == 'true' }
                 }
             }
             steps {
@@ -287,7 +346,7 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
             when {
                 allOf {
                     expression { return !params.DRY_RUN }
-                    expression { return params.PUBLISH_TO == 'pypi' }
+                    expression { return params.PUBLISH_TO == 'pypi' || env.PROMOTE == 'true' }
                 }
             }
             steps {
