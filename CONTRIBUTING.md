@@ -29,6 +29,24 @@ python -m build
 twine check dist/*
 ```
 
+CI runs the same steps through `jenkins/ci.sh`, in a `python:<version>-slim` container per step, so you can reproduce a CI run with only Docker installed:
+
+```bash
+jenkins/ci.sh build
+jenkins/ci.sh test 3.9 3.14
+```
+
+## Continuous integration and releases
+
+Two Jenkins pipelines live under `jenkins/`:
+
+* `jenkins/test/Jenkinsfile` builds every branch and pull request and runs the offline suites against the built wheel on each supported Python version. It uses no credentials, because pull requests to this public repository can come from anyone.
+* `jenkins/release/Jenkinsfile` releases a version, starting from `RELEASE_VERSION` (for example `16.1.0rc1` or `16.1.0`). It stamps that version into `pyproject.toml` on a release commit, then builds and tests it. Only after that does it tag the commit `v<version>` and publish to TestPyPI. With `PUBLISH_TO=pypi` it then waits for a person to approve before publishing to PyPI. After each upload it checks that the index serves exactly the files it built. `DRY_RUN`, on by default, stops after the tests.
+
+Neither index ever accepts a file twice, so a release that fails after uploading continues with the next version. `master` keeps a `.devN` version between releases; moving it on is an ordinary pull request.
+
+The VoltDB distribution bundles a pinned release of this package. Its build checks the wheel against the sha256 the release job prints in its build description, so use that value when updating the pin, not one read back from PyPI.
+
 ## Contributor License Agreement
 
 In order to contribute code to VoltDB, you must first sign the [VoltDB Contributor License Agreement (CLA)](https://www.voltdb.com/contributor-license-agreement/) and email an image or PDF of the document including your hand-written signature to [support@voltdb.com](mailto:support@voltdb.com). VoltDB will sign and return the final copy of the agreement for your records.

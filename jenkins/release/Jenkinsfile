@@ -1,0 +1,293 @@
+// This file is part of VoltDB.
+// Copyright (C) 2026 Volt Active Data Inc.
+//
+// Release pipeline for the voltdbclient package. Configure as a plain Pipeline
+// job (not Multibranch), "Pipeline script from SCM" on master of this
+// repository, with this file as the script path. Run it with parameters.
+//
+// It builds SOURCE_REF with RELEASE_VERSION stamped into pyproject.toml, tests
+// the wheel on every supported Python, and only then tags and publishes:
+//
+//   1. tag v<RELEASE_VERSION> on the release commit and push the tag
+//   2. upload to TestPyPI, and check TestPyPI serves exactly the files built
+//   3. PUBLISH_TO=pypi only: wait for a person to approve, upload to PyPI,
+//      and check PyPI serves exactly the files built
+//
+// The release commit is reachable only from the tag: master keeps its .dev
+// version, and moving it to the next one is an ordinary pull request.
+//
+// The build description shows the wheel's sha256. That value, not one read
+// back from PyPI, goes into volt-python-client/client.properties in the VoltDB
+// server repository, whose build bundles the client into the distribution.
+//
+// Credentials: github-token (push the tag), pypi-test and pypi-prod (API
+// tokens scoped to the voltdbclient project on TestPyPI and PyPI).
+
+@Library('voltdb') _
+
+pipeline {
+    agent {
+        // nospot: this job publishes files that can never be replaced, so it
+        // should not lose its agent halfway through.
+        label 'gcloud-build--rocky-linux-8--x64-nospot'
+    }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '50'))
+        durabilityHint('PERFORMANCE_OPTIMIZED')
+        disableConcurrentBuilds()
+        // Includes up to two hours waiting for the PyPI approval.
+        timeout(time: 3, unit: 'HOURS')
+        githubProjectProperty(projectUrlStr: 'https://github.com/VoltDB/voltdb-client-python/')
+    }
+
+    parameters {
+        string(name: 'RELEASE_VERSION',
+               defaultValue: '',
+               description: '''Version to release: X.Y.Z, or a pre-release X.Y.ZaN, X.Y.ZbN or X.Y.ZrcN.
+The tag is vRELEASE_VERSION. Neither the tag nor the version may exist yet: an index never accepts the same
+file twice, so a failed release continues with the next version (rc2 after rc1, and so on).''')
+        string(name: 'SOURCE_REF',
+               defaultValue: 'master',
+               description: 'Branch to build and tag.')
+        choice(name: 'PUBLISH_TO',
+               choices: ['testpypi', 'pypi'],
+               description: '''testpypi: publish to TestPyPI only.
+pypi: publish to TestPyPI, then to PyPI after a person approves.''')
+        booleanParam(name: 'DRY_RUN',
+                     defaultValue: true,
+                     description: 'Build and test only: no tag, no upload.')
+    }
+
+    environment {
+        // Every Python the package supports (requires-python >= 3.9).
+        PYTHON_VERSIONS = '3.9 3.10 3.11 3.12 3.13 3.14'
+        REPO_URL = 'https://github.com/VoltDB/voltdb-client-python.git'
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    startedStage('Validate Parameters')
+                    def version = params.RELEASE_VERSION?.trim()
+                    if (!version) {
+                        error('RELEASE_VERSION is required, for example 16.1.0rc1 or 16.1.0.')
+                    }
+                    // Release versions only. PEP 440 would normalize other spellings
+                    // (16.1.0-rc1 becomes 16.1.0rc1), and the tag and the files must agree.
+                    if (!(version ==~ /\d+\.\d+\.\d+((a|b|rc)\d+)?/)) {
+                        error("RELEASE_VERSION must be X.Y.Z or X.Y.Z{a,b,rc}N, got '${version}'.")
+                    }
+                    env.VERSION = version
+                    env.TAG = "v${version}"
+                    def mode = params.DRY_RUN ? 'DRY RUN' : params.PUBLISH_TO
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} - ${env.TAG} - ${mode}"
+                    echo "Release ${env.VERSION} from ${params.SOURCE_REF}, tag ${env.TAG}, mode ${mode}"
+                }
+            }
+            post {
+                success { successfulStage('Validate Parameters') }
+                failure { failedStage('Validate Parameters') }
+            }
+        }
+
+        stage('Checkout Source') {
+            steps {
+                script { startedStage('Checkout Source') }
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "refs/heads/${params.SOURCE_REF}"]],
+                    extensions: [[$class: 'CleanBeforeCheckout']],
+                    userRemoteConfigs: [[url: env.REPO_URL, credentialsId: 'github-token']]
+                ])
+                script {
+                    def exists = sh(returnStdout: true,
+                        script: "git ls-remote --tags origin 'refs/tags/${env.TAG}' | wc -l").trim()
+                    if (exists != '0') {
+                        error("Tag ${env.TAG} already exists. Release a new version.")
+                    }
+                    echo "${params.SOURCE_REF} @ " + sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                }
+            }
+            post {
+                success { successfulStage('Checkout Source') }
+                failure { failedStage('Checkout Source') }
+            }
+        }
+
+        stage('Set Release Version') {
+            // The release commit sits on top of SOURCE_REF and is never pushed to a
+            // branch; the tag, created after the tests pass, is what keeps it.
+            steps {
+                script { startedStage('Set Release Version') }
+                sh '''
+                    jenkins/ci.sh set-version "${VERSION}"
+                    git config user.email "ci-release-bot@voltactivedata.com"
+                    git config user.name  "voltdb-release-bot"
+                    if git diff --quiet -- pyproject.toml; then
+                        echo "pyproject.toml on ${SOURCE_REF} is already ${VERSION}; tagging it as it is"
+                    else
+                        git commit -q -m "Set version to ${VERSION} for release ${TAG}" pyproject.toml
+                    fi
+                    echo "release commit: $(git rev-parse --short HEAD)"
+                '''
+                // Fail before building anything if an index already has this version.
+                sh 'jenkins/ci.sh unpublished testpypi'
+                script {
+                    if (params.PUBLISH_TO == 'pypi') {
+                        sh 'jenkins/ci.sh unpublished pypi'
+                    }
+                }
+            }
+            post {
+                success { successfulStage('Set Release Version') }
+                failure { failedStage('Set Release Version') }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script { startedStage('Build') }
+                sh 'jenkins/ci.sh build'
+            }
+            post {
+                success { successfulStage('Build') }
+                failure { failedStage('Build') }
+            }
+        }
+
+        stage('Test') {
+            // The release commit is new, so no earlier test run covers it.
+            steps {
+                script { startedStage('Test') }
+                sh 'jenkins/ci.sh test ${PYTHON_VERSIONS}'
+            }
+            post {
+                always {
+                    junit testResults: 'reports/*.xml', allowEmptyResults: false
+                }
+                success { successfulStage('Test') }
+                failure { failedStage('Test') }
+            }
+        }
+
+        stage('Checksum') {
+            steps {
+                script {
+                    startedStage('Checksum')
+                    sh 'jenkins/ci.sh checksum'
+                    archiveArtifacts artifacts: 'dist/*', fingerprint: true
+                    def wheel = "voltdbclient-${env.VERSION}-py3-none-any.whl"
+                    env.WHEEL_SHA256 = sh(returnStdout: true,
+                        script: "awk '\$2 == \"${wheel}\" { print \$1 }' dist/SHA256SUMS").trim()
+                    if (!(env.WHEEL_SHA256 ==~ /[0-9a-f]{64}/)) {
+                        error("No sha256 for ${wheel} in dist/SHA256SUMS")
+                    }
+                    currentBuild.description = """
+                        <b>Tag:</b> ${env.TAG}<br/>
+                        <b>Mode:</b> ${params.DRY_RUN ? 'DRY RUN' : params.PUBLISH_TO}<br/>
+                        <b>Pin for client.properties:</b><br/>
+                        voltdbclient.version=${env.VERSION}<br/>
+                        voltdbclient.sha256=${env.WHEEL_SHA256}
+                    """.stripIndent().trim()
+                }
+            }
+            post {
+                success { successfulStage('Checksum') }
+                failure { failedStage('Checksum') }
+            }
+        }
+
+        stage('Publish Tag') {
+            // After the tests, before any upload: a tag can never name code that
+            // failed, and a release is never uploaded without its tag.
+            when { expression { return !params.DRY_RUN } }
+            steps {
+                script { startedStage('Publish Tag') }
+                withCredentials([usernamePassword(credentialsId: 'github-token',
+                                                  usernameVariable: 'GH_USER',
+                                                  passwordVariable: 'GH_TOKEN')]) {
+                    sh '''
+                        # The checkout credential is scoped to the checkout step, so
+                        # git has none here until gh installs the token as its helper.
+                        git remote set-url origin "${REPO_URL}"
+                        gh auth setup-git
+                        git tag -a "${TAG}" -m "Release ${VERSION}"
+                        git push origin "refs/tags/${TAG}"
+                        echo "pushed ${TAG} at $(git rev-parse --short HEAD)"
+                    '''
+                }
+            }
+            post {
+                success { successfulStage('Publish Tag') }
+                failure { failedStage('Publish Tag') }
+            }
+        }
+
+        stage('Publish to TestPyPI') {
+            when { expression { return !params.DRY_RUN } }
+            steps {
+                script { startedStage('Publish to TestPyPI') }
+                withCredentials([string(credentialsId: 'pypi-test', variable: 'TWINE_PASSWORD')]) {
+                    sh 'jenkins/ci.sh upload testpypi'
+                }
+                sh 'jenkins/ci.sh verify testpypi'
+            }
+            post {
+                success { successfulStage('Publish to TestPyPI') }
+                failure { failedStage('Publish to TestPyPI') }
+            }
+        }
+
+        stage('Approve PyPI') {
+            when {
+                allOf {
+                    expression { return !params.DRY_RUN }
+                    expression { return params.PUBLISH_TO == 'pypi' }
+                }
+            }
+            steps {
+                timeout(time: 2, unit: 'HOURS') {
+                    input message: "Publish voltdbclient ${env.VERSION} to PyPI? " +
+                                   "It is on TestPyPI now, and a PyPI release can never be replaced.",
+                          ok: 'Publish to PyPI'
+                }
+            }
+        }
+
+        stage('Publish to PyPI') {
+            when {
+                allOf {
+                    expression { return !params.DRY_RUN }
+                    expression { return params.PUBLISH_TO == 'pypi' }
+                }
+            }
+            steps {
+                script { startedStage('Publish to PyPI') }
+                withCredentials([string(credentialsId: 'pypi-prod', variable: 'TWINE_PASSWORD')]) {
+                    sh 'jenkins/ci.sh upload pypi'
+                }
+                sh 'jenkins/ci.sh verify pypi'
+            }
+            post {
+                success { successfulStage('Publish to PyPI') }
+                failure { failedStage('Publish to PyPI') }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackBuildStatus(true)
+        }
+        failure {
+            slackBuildStatus(false)
+        }
+        // cleanup, not always: it must run after everything else.
+        cleanup {
+            cleanWs()
+        }
+    }
+}
