@@ -15,3 +15,9 @@ __pycache__/
 /.vscode/
 
 .DS_Store
+
+# Build and packaging outputs
+/build/
+/dist/
+*.egg-info/
+/.venv/

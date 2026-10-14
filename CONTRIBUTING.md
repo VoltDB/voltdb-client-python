@@ -8,6 +8,27 @@ VoltDB uses the standard github workflow, meaning we make use of forking and pul
 
 * If you are interested in contributing something more involved, feel free to discuss your ideas in [VoltDB Public](http://chat.voltdb.com/) on Slack.
 
+## Development
+
+The client is two pure-Python modules, `src/voltdbclient.py` and `src/voltclient.py`, with no third-party dependencies. Install the checkout in editable mode and run the offline tests, which need no server:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+python -m unittest discover -s tests -v
+```
+
+The end-to-end tests against a live cluster, and the benchmark, run in the VoltDB server's own build. They use the client release that the VoltDB distribution ships, so a new release is tested against the server when the server build moves to it.
+
+To build the distributions that get published to PyPI:
+
+```bash
+pip install build twine
+python -m build
+twine check dist/*
+```
+
 ## Contributor License Agreement
 
 In order to contribute code to VoltDB, you must first sign the [VoltDB Contributor License Agreement (CLA)](https://www.voltdb.com/contributor-license-agreement/) and email an image or PDF of the document including your hand-written signature to [support@voltdb.com](mailto:support@voltdb.com). VoltDB will sign and return the final copy of the agreement for your records.

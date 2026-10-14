@@ -1,0 +1,5 @@
+# The source distribution carries the tests, their fixtures and the examples,
+# so the offline suites can run from it. The wheel holds only the two modules.
+graft tests
+graft examples
+global-exclude __pycache__ *.py[cod]
