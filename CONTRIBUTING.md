@@ -43,7 +43,9 @@ Two Jenkins pipelines live under `jenkins/`:
 * `jenkins/test/Jenkinsfile`, the job `VoltDB/Python Client/Tests`, builds every branch of this repository and runs the offline suites against the built wheel on each supported Python version. Pull requests from forks are not built; a maintainer pushes the branch here to test one. The job uses no credentials.
 * `jenkins/release/Jenkinsfile`, the job `VoltDB/Python Client/Release`, releases a version, starting from `RELEASE_VERSION` (for example `16.1.0rc1` or `16.1.0`). It stamps that version into `pyproject.toml` on a release commit, then builds and tests it. Only after that does it tag the commit `v<version>` and publish to TestPyPI. With `PUBLISH_TO=pypi` it then waits for a person to approve before publishing to PyPI. After each upload it checks that the index serves exactly the files it built. `DRY_RUN`, on by default, stops after the tests.
 
-Neither index ever accepts a file twice, so a release that fails after uploading continues with the next version. `master` keeps a `.devN` version between releases; moving it on is an ordinary pull request.
+`MODE=promote` publishes a version that is already tagged and on TestPyPI to PyPI without rebuilding it. It downloads the wheel and the sdist from TestPyPI, checks them against TestPyPI's hashes, and runs the tests on that wheel. After a person approves, it uploads the same files to PyPI.
+
+Neither index ever accepts a file twice, so a release that fails after uploading to TestPyPI is finished with promote, or continues with the next version. `master` keeps a `.devN` version between releases; moving it on is an ordinary pull request.
 
 The VoltDB distribution bundles a pinned release of this package. Its build checks the wheel against the sha256 the release job prints in its build description, so use that value when updating the pin, not one read back from PyPI.
 
