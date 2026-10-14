@@ -11,6 +11,15 @@ This repository contains two Python client libraries for VoltDB:
 
 Because `VoltClient` uses `voltdbclient`'s serialization underneath, the two modules share the same type constants and return the same `VoltResponse` / `VoltTable` objects — they interoperate naturally, and you can migrate one call site at a time.
 
+What `VoltClient` gives an application:
+
+- **One client for the whole cluster.** Name any node; the client discovers the rest and keeps a connection to each.
+- **Client affinity.** Each single-partition call goes straight to the node that leads its partition.
+- **Synchronous and asynchronous calls.** `call` blocks; `call_async` returns a `concurrent.futures.Future`, which `asyncio` code can await.
+- **Cluster changes without restarts.** The cluster pushes topology changes to the client, so node failures, rejoins and elastic expansion are followed automatically.
+- **Bulk loading.** `VoltBulkLoader` loads a table in per-partition batches, one transaction per batch.
+- **A bound on load.** `max_outstanding` caps the calls in flight, which keeps latency predictable.
+
 Both modules are pure Python with no third-party dependencies. `voltclient` and the PyPI package require Python 3.9 or later; `voltdbclient.py` on its own still accepts Python 3.6.
 
 ## Installation
@@ -43,6 +52,32 @@ with VoltClient(hosts=["voltsvr1", "voltsvr2"]) as client:
 
 Give `hosts` any subset of the cluster: the client discovers the full membership at connect time and opens one connection per node. Use the client as a context manager (or call `close()`) so its background threads and sockets are always torn down.
 
+## Connecting
+
+All `VoltClient` constructor arguments are keywords with defaults:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `hosts` | | Names or addresses of the nodes to connect to first. Any subset of the cluster will do. |
+| `port` | `21212` | The client port, the same on every node. |
+| `username`, `password` | `""` | Credentials, for a database with security enabled. |
+| `usessl` | `False` | Connect over TLS. |
+| `ssl_config_file` | `None` | A properties file naming the keystore and truststore, in the format VoltDB's Java tools use. |
+| `default_cacerts` | `True` | With TLS and no `ssl_config_file`, check the server's certificate against the system's default CA certificates. If `False`, the certificate is not checked at all. |
+| `kerberos` | `False` | Authenticate with Kerberos (needs `voltdbclient[extras]`). |
+| `connect_timeout` | `8` | Seconds to wait for a connection to open. |
+| `procedure_timeout` | `120` | Default timeout of a call, in seconds. A `timeout` passed to the call overrides it. |
+| `max_outstanding` | `3000` | Calls in flight at once; see [Bounding load](#bounding-load-max_outstanding). |
+| `connection_response_timeout` | `30` | A connection idle this many seconds is pinged, and declared dead if the ping goes unanswered as long. |
+| `initial_backoff`, `max_backoff`, `reconnect_jitter` | `0.5`, `30`, `0.2` | Reconnect backoff in seconds, and the fraction of random jitter added to each wait. |
+
+For example, a TLS connection with credentials:
+
+```python
+client = VoltClient(hosts=["voltsvr1"], username="app", password="secret",
+                    usessl=True, ssl_config_file="/etc/voltdb/ssl.properties")
+```
+
 ## Calls
 
 - `call(proc_name, param_types, params, timeout=None)` — send and block for the `VoltResponse`.
@@ -64,8 +99,20 @@ for f in concurrent.futures.as_completed(futures):
 
 One caution: callbacks registered with `Future.add_done_callback` run on the client's network reader threads. Keep them short and never block in them (no `call` or `call_async`, no lock waits) — parse, record, hand off.
 
-- `call_all_partitions(proc_name, param_types=None, params=None, timeout=None)` — run a procedure once on every partition and return one `PartitionCallResult` per partition (sorted by partition id), each carrying either the partition's `response` or the `error` that ended its leg; `ok` summarizes. Works with procedures partitioned on their first parameter and with directed procedures. `call_all_partitions_async` is the Future form. One timeout budget covers the whole fan-out.
+- `call_all_partitions(proc_name, param_types=None, params=None, timeout=None)` — run a procedure once on every partition and return one `PartitionCallResult` per partition (sorted by partition id), each carrying either the partition's `response` or the `error` that ended its leg; `ok` summarizes. Works with procedures partitioned on their first parameter and with directed procedures. Leave the partitioning parameter out: the client supplies a key for each partition and prepends it, so `param_types` and `params` carry only the remaining parameters. `call_all_partitions_async` is the Future form. One timeout budget covers the whole fan-out.
+
+```python
+# A procedure partitioned on its first parameter, which is its only one:
+# no parameters to pass.
+for result in client.call_all_partitions("CountRowsInPartition"):
+    if result.ok:
+        print(result.partition_id, result.response.tables[0].tuples)
+    else:
+        print(result.partition_id, result.error or result.response.statusString)
+```
+
 - `get_partition_for_parameter(vtype, value)` — which partition a value hashes to, using the same elastic hashinator the cluster uses. Useful for batching work by partition before sending it.
+- `outstanding_requests` — the number of calls currently in flight.
 
 ## Bulk loading
 
@@ -88,6 +135,7 @@ print(loader.completed_row_count, loader.failed_row_count)
 - `insert_row` checks each value against its column (no silent coercion or truncation: a `str` for an `INTEGER` column, an out-of-range number, or a NULL partition key fails that row through `failure_callback` with a `VoltTypeError`). TIMESTAMP accepts `datetime` (naive means local time) or integer microseconds since the epoch; DECIMAL accepts `decimal.Decimal` or `int`; VARBINARY accepts any bytes-like value.
 - If the server rejects a batch (a constraint violation, a value too long for its column), none of its rows are inserted, so they are retried one at a time and only the rows that actually fail are reported. A batch whose outcome is unknown (connection lost or timed out) is retried the same way. In insert mode, a row that did load may then be reported as a duplicate-key failure, or inserted twice on a table without a primary key. Use `upsert=True` if that matters.
 - `failure_callback` runs on a client network thread. Keep it quick, and don't call the loader (`insert_row`, `flush`, `drain`, `close`) or the client from it. To re-insert a corrected row, hand it to another thread.
+- `insert_rows(rows)` inserts an iterable of rows. `timeout` (default: the client's `procedure_timeout`) applies to each batch. `completed_row_count`, `failed_row_count` and `outstanding_row_count` report progress, and `column_names` / `column_types` describe the table.
 - `flush()` sends partially filled batches, `drain()` also waits until every row is loaded or failed (including rows other threads insert meanwhile), and `close()` (or leaving the `with` block) stops accepting rows, then drains. `insert_row` may be called from several threads. Without a `failure_callback`, the first failure is logged as a warning and `close()` logs the total.
 - A `batch_size` of 500–1,000 is a good default: much larger batches leave too few in flight per partition to keep the cluster busy. `max_batches_in_flight` (default 32) bounds memory and server queue depth.
 - Supported column types: TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, VARCHAR, TIMESTAMP, DECIMAL, VARBINARY.
@@ -96,7 +144,7 @@ print(loader.completed_row_count, loader.failed_row_count)
 
 Both clients return the same objects, defined in `voltdbclient`:
 
-- `VoltResponse` — `status` (integer; 1 is success — see the VoltDB documentation for the full list), `statusString` (human-readable meaning), `roundtripTime` (milliseconds), `tables` (list of `VoltTable`, or `None`), and `exception` (a `VoltException`, or `None`).
+- `VoltResponse` — `status` (integer; 1 is success — see the VoltDB documentation for the full list), `statusString` (human-readable meaning), `roundtripTime` (milliseconds), `tables` (list of `VoltTable`, or `None`), `exception` (a `VoltException`, or `None`), and `appStatus` / `appStatusString` (the status a procedure set for itself).
 - `VoltTable` — `columns` (list of `VoltColumn`, each with `name` and `type`) and `tuples` (list of rows; each row is a list of values already converted to Python types).
 - `VoltException` — `type` (one of the `VOLTEXCEPTION_*` constants: `NONE`, `EEEXCEPTION`, `SQLEXCEPTION`, `CONSTRAINTFAILURE`, `GENERIC`) and `message`.
 
@@ -105,6 +153,7 @@ Parameter types are declared with the `VoltType` constants (`VoltType.BIGINT`, `
 | VoltDB type | Python type         |
 |-------------|---------------------|
 | NULL        | `None`              |
+| BOOLEAN     | `bool`              |
 | TINYINT     | `int`               |
 | SMALLINT    | `int`               |
 | INTEGER     | `int`               |
@@ -113,9 +162,12 @@ Parameter types are declared with the `VoltType` constants (`VoltType.BIGINT`, `
 | DECIMAL     | `decimal.Decimal`   |
 | STRING      | `str`               |
 | TIMESTAMP   | `datetime.datetime` |
-| VARBINARY   | `bytes` (byte array on read) |
+| DATE        | `datetime.date`     |
+| VARBINARY   | `bytes` to send; `array.array('B')` when read |
+| GEOGRAPHY_POINT | a `(longitude, latitude)` tuple of floats |
+| GEOGRAPHY   | `Geography` |
 
-Python does not distinguish integer widths, but a value serialized as a given type must fit it — an out-of-range value raises an error. Array parameters are passed as Python lists, declared with their element type. The `Geography` and `XYZPoint` value classes are importable from `voltclient` as well.
+Python does not distinguish integer widths, but a value serialized as a given type must fit it — an out-of-range value raises an error. Array parameters are passed as Python lists, declared with their element type. `Geography.geographyFromWKT("POLYGON((...))")` builds a `Geography` from well-known text and `str()` turns one back into it; `Geography.pointFromWKT("POINT(lng lat)")` gives a point tuple. `Geography` and `XYZPoint` are importable from `voltclient` as well.
 
 ## Topology awareness
 
@@ -125,7 +177,7 @@ The client keeps its view of the cluster current by **subscription, not polling*
 - **Self-healing membership.** Node failures, rejoins, and elastic cluster expansions flow into the connection pool and the routing tables without an application restart. A lost connection's in-flight calls fail (see the failure contract below); the pool redials and re-converges in the background with capped exponential backoff.
 - **No stale-routing hazard.** A call routed on a topology that just changed is forwarded or transparently restarted by the cluster on the correct node — a small latency cost, never a correctness one.
 
-`client.topology` exposes the current snapshot (hosts, partition leaders, procedure partitioning) and `refresh_topology()` remains available as a manual backstop for applications that want their own schedule on top.
+`client.topology` exposes the current snapshot (hosts, partition leaders, procedure partitioning) and `refresh_topology()` remains available as a manual backstop for applications that want their own schedule on top. If the server declines the subscription (for example while the database is paused), the client keeps working and tries again two minutes later.
 
 ## Bounding load: `max_outstanding`
 
@@ -148,13 +200,13 @@ Server-side failures (constraint violations, procedure exceptions) are not Pytho
 
 ## Performance characteristics
 
-What to expect, and why (measured with the benchmark harness noted below):
+What to expect, and why:
 
 - A synchronous single-connection client's throughput ceiling is one call per round-trip: `FastSerializer` used directly cannot exceed `1/RTT` calls per second. `VoltClient`'s pipelining removes that wall: its ceiling is the Python interpreter itself — one CPU core's worth of serialization and dispatch, independent of network latency. Writes and reads are batched on the socket, so one process sustains on the order of 50,000 single-row calls per second against a local server (measured with small rows; your numbers depend on row size and hardware).
 - Latency at moderate concurrency is competitive with any client: per-call time is dominated by the network and the server, and affinity routing removes a network hop from every single-partition call.
 - A single Python process will not saturate a VoltDB cluster row by row — that is a property of CPython, not of this client. For loading tables, `VoltBulkLoader` runs one server transaction per batch instead of per row, which is several times faster; beyond that, run several processes.
 
-The benchmark harness lives in the VoltDB source tree at `tests/pyclient/bench.py`. It drives the well-known `voltkv` workload — same schema, keys, and default procedures as the voltkv example app — comparing direct `FastSerializer` usage against `VoltClient` across a sweep of `max_outstanding` values and printing throughput with latency percentiles for each point, then compares loading the key pool row by row with `VoltBulkLoader` at several batch sizes.
+These figures come from a benchmark run in VoltDB's own testing. It drives the `voltkv` workload (the schema, keys and default procedures of the voltkv example app), comparing direct `FastSerializer` use with `VoltClient` across a sweep of `max_outstanding` values, then compares loading rows one at a time with `VoltBulkLoader` at several batch sizes.
 
 ## Migrating from `voltdbclient`
 
@@ -204,6 +256,14 @@ Details worth knowing:
 The client logs through the standard `logging` module under the logger name `voltclient` (connection lifecycle at INFO/DEBUG, degraded-routing and subscription warnings at WARNING). It adds no handlers of its own.
 
 Full API details are in the module docstrings: `pydoc voltclient`.
+
+## Examples
+
+The [examples](examples) directory has small programs for the schemas in the VoltDB kit's tutorials and examples:
+
+- `voltclient_helloworld.py` — Hello World with `VoltClient`: asynchronous inserts, then a query.
+- `helloworld.py` — the same with `FastSerializer`.
+- `voter.py` — the Voter example's client, with `FastSerializer`.
 
 ## Contributing
 
