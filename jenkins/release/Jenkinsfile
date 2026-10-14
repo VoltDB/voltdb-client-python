@@ -21,8 +21,10 @@
 // back from PyPI, goes into volt-python-client/client.properties in the VoltDB
 // server repository, whose build bundles the client into the distribution.
 //
-// Credentials: github-token (push the tag), pypi-test and pypi-prod (API
-// tokens scoped to the voltdbclient project on TestPyPI and PyPI).
+// Credentials, the ones the VoltDB TagAndRelease pipeline uses:
+// jenkins-for-devs-github-ssh-key (check out over SSH and push the tag), and
+// pypi-test and pypi-prod (username-with-password, the API token being the
+// password) for TestPyPI and PyPI.
 
 @Library('voltdb') _
 
@@ -64,7 +66,7 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
     environment {
         // Every Python the package supports (requires-python >= 3.9).
         PYTHON_VERSIONS = '3.9 3.10 3.11 3.12 3.13 3.14'
-        REPO_URL = 'https://github.com/VoltDB/voltdb-client-python.git'
+        REPO_URL = 'git@github.com:VoltDB/voltdb-client-python.git'
     }
 
     stages {
@@ -101,14 +103,30 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
                     $class: 'GitSCM',
                     branches: [[name: "refs/heads/${params.SOURCE_REF}"]],
                     extensions: [[$class: 'CleanBeforeCheckout']],
-                    userRemoteConfigs: [[url: env.REPO_URL, credentialsId: 'github-token']]
+                    userRemoteConfigs: [[url: env.REPO_URL, credentialsId: 'jenkins-for-devs-github-ssh-key']]
                 ])
-                script {
-                    def exists = sh(returnStdout: true,
-                        script: "git ls-remote --tags origin 'refs/tags/${env.TAG}' | wc -l").trim()
-                    if (exists != '0') {
-                        error("Tag ${env.TAG} already exists. Release a new version.")
+                // The checkout's credential is scoped to the checkout step, so bind
+                // the key again for git and point git at it, as TagAndRelease does.
+                withCredentials([sshUserPrivateKey(credentialsId: 'jenkins-for-devs-github-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY')]) {
+                    script {
+                        def exists = sh(returnStdout: true, script: '''
+                            export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
+                            git ls-remote --tags origin "refs/tags/${TAG}" | wc -l
+                        ''').trim()
+                        if (exists != '0') {
+                            error("Tag ${env.TAG} already exists. Release a new version.")
+                        }
                     }
+                    // Fail now, before anything is built or uploaded, if the key cannot
+                    // push to this repository. --dry-run asks GitHub for push access
+                    // and creates nothing, so a DRY_RUN checks it too.
+                    sh '''
+                        export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
+                        git push --dry-run origin "HEAD:refs/tags/${TAG}"
+                    '''
+                }
+                script {
                     echo "${params.SOURCE_REF} @ " + sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
                 }
             }
@@ -207,14 +225,10 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
             when { expression { return !params.DRY_RUN } }
             steps {
                 script { startedStage('Publish Tag') }
-                withCredentials([usernamePassword(credentialsId: 'github-token',
-                                                  usernameVariable: 'GH_USER',
-                                                  passwordVariable: 'GH_TOKEN')]) {
+                withCredentials([sshUserPrivateKey(credentialsId: 'jenkins-for-devs-github-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY')]) {
                     sh '''
-                        # The checkout credential is scoped to the checkout step, so
-                        # git has none here until gh installs the token as its helper.
-                        git remote set-url origin "${REPO_URL}"
-                        gh auth setup-git
+                        export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
                         git tag -a "${TAG}" -m "Release ${VERSION}"
                         git push origin "refs/tags/${TAG}"
                         echo "pushed ${TAG} at $(git rev-parse --short HEAD)"
@@ -231,7 +245,11 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
             when { expression { return !params.DRY_RUN } }
             steps {
                 script { startedStage('Publish to TestPyPI') }
-                withCredentials([string(credentialsId: 'pypi-test', variable: 'TWINE_PASSWORD')]) {
+                // Username with password: the API token is the password, as in
+                // TagAndRelease; the username is unused (twine sends __token__).
+                withCredentials([usernamePassword(credentialsId: 'pypi-test',
+                                                  usernameVariable: 'PYPI_USER',
+                                                  passwordVariable: 'TWINE_PASSWORD')]) {
                     sh 'jenkins/ci.sh upload testpypi'
                 }
                 sh 'jenkins/ci.sh verify testpypi'
@@ -267,7 +285,11 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
             }
             steps {
                 script { startedStage('Publish to PyPI') }
-                withCredentials([string(credentialsId: 'pypi-prod', variable: 'TWINE_PASSWORD')]) {
+                // Username with password: the API token is the password, as in
+                // TagAndRelease; the username is unused (twine sends __token__).
+                withCredentials([usernamePassword(credentialsId: 'pypi-prod',
+                                                  usernameVariable: 'PYPI_USER',
+                                                  passwordVariable: 'TWINE_PASSWORD')]) {
                     sh 'jenkins/ci.sh upload pypi'
                 }
                 sh 'jenkins/ci.sh verify pypi'
