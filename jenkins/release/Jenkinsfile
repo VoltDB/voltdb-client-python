@@ -107,22 +107,29 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
                 ])
                 // The checkout's credential is scoped to the checkout step, so bind
                 // the key again for git and point git at it, as TagAndRelease does.
+                // The key path is quoted inside GIT_SSH_COMMAND, which git runs through
+                // a shell: this job's workspace, "Python Client/Release", has a space.
                 withCredentials([sshUserPrivateKey(credentialsId: 'jenkins-for-devs-github-ssh-key',
                                                    keyFileVariable: 'SSH_KEY')]) {
                     script {
-                        def exists = sh(returnStdout: true, script: '''
-                            export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
-                            git ls-remote --tags origin "refs/tags/${TAG}" | wc -l
-                        ''').trim()
-                        if (exists != '0') {
+                        // --exit-code: 0 if the tag exists, 2 if it does not; anything
+                        // else means the lookup itself failed.
+                        def rc = sh(returnStatus: true, script: '''
+                            export GIT_SSH_COMMAND="ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
+                            git ls-remote --exit-code --tags origin "refs/tags/${TAG}"
+                        ''')
+                        if (rc == 0) {
                             error("Tag ${env.TAG} already exists. Release a new version.")
+                        }
+                        if (rc != 2) {
+                            error("Could not list the repository's tags (git ls-remote exited ${rc})")
                         }
                     }
                     // Fail now, before anything is built or uploaded, if the key cannot
                     // push to this repository. --dry-run asks GitHub for push access
                     // and creates nothing, so a DRY_RUN checks it too.
                     sh '''
-                        export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
+                        export GIT_SSH_COMMAND="ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
                         git push --dry-run origin "HEAD:refs/tags/${TAG}"
                     '''
                 }
@@ -228,7 +235,7 @@ pypi: publish to TestPyPI, then to PyPI after a person approves.''')
                 withCredentials([sshUserPrivateKey(credentialsId: 'jenkins-for-devs-github-ssh-key',
                                                    keyFileVariable: 'SSH_KEY')]) {
                     sh '''
-                        export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
+                        export GIT_SSH_COMMAND="ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
                         git tag -a "${TAG}" -m "Release ${VERSION}"
                         git push origin "refs/tags/${TAG}"
                         echo "pushed ${TAG} at $(git rev-parse --short HEAD)"
