@@ -1,0 +1,38 @@
+[build-system]
+# 77 is the first setuptools release that reads the SPDX license expression below.
+requires      = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voltdbclient"
+version = "16.1.0.dev0"
+description = "VoltDB Python client: the original single-connection client and the topology-aware VoltClient"
+readme = "README.md"
+authors = [{ name = "Volt Active Data", email = "support@voltactivedata.com" }]
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+]
+
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+# pyjks and cryptography read Java keystores for TLS; gssapi does Kerberos authentication.
+extras = ["pyjks", "cryptography", "gssapi"]
+
+[project.urls]
+Homepage = "https://www.voltactivedata.com/"
+Documentation = "https://docs.voltactivedata.com/"
+Source = "https://github.com/VoltDB/voltdb-client-python"
+
+# Two top-level modules, not a package: applications import voltdbclient and
+# voltclient directly, as they do from lib/python of the VoltDB distribution.
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["voltdbclient", "voltclient"]

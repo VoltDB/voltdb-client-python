@@ -1,0 +1,79 @@
+// This file is part of VoltDB.
+// Copyright (C) 2026 Volt Active Data Inc.
+//
+// Tests for voltdb-client-python. The multibranch job VoltDB/Python Client/Tests
+// on dev Jenkins (defined in VoltDB/jenkins-jobs) runs this file for every
+// branch of the repository. It builds the sdist and the wheel, then installs
+// the wheel into a clean venv on every supported Python and runs the offline
+// suites against it.
+//
+// The job discovers only this repository's own branches, so pull requests from
+// forks of this public repository are not built. Even so, the job binds no
+// credentials, and nothing it runs needs one (containers are pulled from
+// mirror.gcr.io without a login), so building unreviewed code exposes nothing.
+//
+// The end-to-end tests against a live cluster run in the VoltDB server build,
+// against the client release that the VoltDB distribution ships.
+
+@Library('voltdb') _
+
+pipeline {
+    agent {
+        label 'gcloud-build--rocky-linux-8--x64'
+    }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        durabilityHint('PERFORMANCE_OPTIMIZED')
+        disableConcurrentBuilds(abortPrevious: true)
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    environment {
+        // Every Python the package supports (requires-python >= 3.9).
+        PYTHON_VERSIONS = '3.9 3.10 3.11 3.12 3.13 3.14'
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                startedStage('Build')
+                sh 'jenkins/ci.sh build'
+            }
+            post {
+                success { successfulStage('Build') }
+                failure { failedStage('Build') }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                startedStage('Test')
+                sh 'jenkins/ci.sh test ${PYTHON_VERSIONS}'
+            }
+            post {
+                always {
+                    junit testResults: 'reports/*.xml', allowEmptyResults: true
+                }
+                success { successfulStage('Test') }
+                failure { failedStage('Test') }
+            }
+        }
+    }
+
+    post {
+        success {
+            archiveArtifacts artifacts: 'dist/*', fingerprint: true
+            slackBuildStatus(true)
+        }
+        failure {
+            slackBuildStatus(false)
+        }
+        // cleanup, not always: post conditions run in a fixed order, and always
+        // comes before success, which would archive an already-cleaned workspace.
+        cleanup {
+            cleanWs()
+        }
+    }
+}
