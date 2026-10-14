@@ -1,17 +1,16 @@
 // This file is part of VoltDB.
 // Copyright (C) 2026 Volt Active Data Inc.
 //
-// Tests for voltdb-client-python. Configure as a Multibranch Pipeline over this
-// repository's branches and pull requests, with this file as the script path.
-// It builds the sdist and the wheel, then installs the wheel into a clean venv
-// on every supported Python and runs the offline suites against it.
+// Tests for voltdb-client-python. The multibranch job VoltDB/Python Client/Tests
+// on dev Jenkins (defined in VoltDB/jenkins-jobs) runs this file for every
+// branch of the repository. It builds the sdist and the wheel, then installs
+// the wheel into a clean venv on every supported Python and runs the offline
+// suites against it.
 //
-// The repository is public, so a pull request can come from anyone, and its
-// code (jenkins/ci.sh, the tests) runs on the agent. This job therefore binds
-// no credentials, and nothing it runs needs one: containers are pulled from
-// mirror.gcr.io without a login. In the job's GitHub source, trust Jenkinsfile
-// changes only from users with write access, so a fork cannot edit this file
-// to bind one.
+// The job discovers only this repository's own branches, so pull requests from
+// forks of this public repository are not built. Even so, the job binds no
+// credentials, and nothing it runs needs one (containers are pulled from
+// mirror.gcr.io without a login), so building unreviewed code exposes nothing.
 //
 // The end-to-end tests against a live cluster run in the VoltDB server build,
 // against the client release that the VoltDB distribution ships.

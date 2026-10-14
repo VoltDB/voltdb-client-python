@@ -1,9 +1,10 @@
 // This file is part of VoltDB.
 // Copyright (C) 2026 Volt Active Data Inc.
 //
-// Release pipeline for the voltdbclient package. Configure as a plain Pipeline
-// job (not Multibranch), "Pipeline script from SCM" on master of this
-// repository, with this file as the script path. Run it with parameters.
+// Release pipeline for the voltdbclient package. The job VoltDB/Python Client/Release
+// on dev Jenkins (defined in VoltDB/jenkins-jobs) runs this file from master.
+// Run it with parameters. Jenkins learns the parameters from this file, so the
+// job's very first build only registers them and stops at Validate Parameters.
 //
 // It builds SOURCE_REF with RELEASE_VERSION stamped into pyproject.toml, tests
 // the wheel on every supported Python, and only then tags and publishes:
