@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voltdbclient"
-version = "16.1.0.dev0"
+version = "16.1.0"
 description = "VoltDB Python client: the original single-connection client and the topology-aware VoltClient"
 readme = "README.md"
 authors = [{ name = "Volt Active Data", email = "support@voltactivedata.com" }]
