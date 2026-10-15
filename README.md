@@ -259,7 +259,7 @@ Full API details are in the module docstrings: `pydoc voltclient`.
 
 ## Examples
 
-The [examples](examples) directory has small programs for the schemas in the VoltDB kit's tutorials and examples:
+The [examples](https://github.com/VoltDB/voltdb-client-python/tree/master/examples) directory has small programs for the schemas in the VoltDB kit's tutorials and examples:
 
 - `voltclient_helloworld.py` — Hello World with `VoltClient`: asynchronous inserts, then a query.
 - `helloworld.py` — the same with `FastSerializer`.
@@ -267,4 +267,4 @@ The [examples](examples) directory has small programs for the schemas in the Vol
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build the package and run the tests.
+See [CONTRIBUTING.md](https://github.com/VoltDB/voltdb-client-python/blob/master/CONTRIBUTING.md) for how to build the package and run the tests.
